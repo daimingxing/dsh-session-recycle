@@ -240,14 +240,17 @@ window.__ModuleLoader__.load({
      * 无参会在最近工作区开一个 blank 并 replaceMain（DSH 自带归档的 clearMain
      * 语义在删除场景的等价物）。删的是别的会话时不调用，避免打断当前查看。
      */
-    function resetMainIfDeleted(ctx, sessionId) {
-      if (currentMainSessionId(ctx) !== sessionId) return;
+    function resetMainIfDeleted(clientCtx, sessionId) {
+      if (currentMainSessionId(clientCtx) !== sessionId) return;
       try {
-        ctx.get('uiWorkspace')?.startSession?.();
+        clientCtx.get('uiWorkspace')?.startSession?.();
       } catch { /* 主区复位失败不影响删除本身 */ }
     }
 
-    function DeleteSessionMenuItem({ sessionId, useMenuOpenState, t }) {
+    /** 槽位 inject 工厂：把 client ctx 传给组件 props（组件不在 apply 词法作用域内）。 */
+    const menuInjected = (clientCtx) => () => ({ clientCtx });
+
+    function DeleteSessionMenuItem({ sessionId, useMenuOpenState, clientCtx, t }) {
       const setMenuOpen = useMenuOpenState?.()[1];
       const [busy, setBusy] = React.useState(false);
       return h('button', {
@@ -266,7 +269,7 @@ window.__ModuleLoader__.load({
               showToast({ text: t('toast.alreadyTrashed'), holdMs: 3000, onAction: null });
               return;
             }
-            resetMainIfDeleted(ctx, sessionId);
+            resetMainIfDeleted(clientCtx, sessionId);
             notifyDeleted(t, sessionId, (error) => showToast({
               text: t('toast.restoreFailed', { message: String(error?.message ?? error) }),
               holdMs: 4000,
@@ -441,7 +444,13 @@ window.__ModuleLoader__.load({
       const labelTrash = () => t('trash.title');
 
       ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register(
-        { name: 'sidebar.workspaces.session.menu.item', id: 'session-trash:delete', order: 900, locale: NS },
+        {
+          name: 'sidebar.workspaces.session.menu.item',
+          id: 'session-trash:delete',
+          order: 900,
+          locale: NS,
+          inject: menuInjected(ctx),
+        },
         DeleteSessionMenuItem,
       ));
       ctx.slots.inject('shell.overlay', () => ctx.slots.register(
