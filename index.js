@@ -43,6 +43,8 @@ const PREVIEW_TAIL = 60;
 const ZSTD_MAGIC = 0xfd2fb528;
 /** 启动巡检延迟毫秒（等服务就绪、会话尚未被打开）。 */
 const BOOT_SWEEP_DELAY_MS = 3000;
+/** 周期兜底巡检间隔毫秒（agent/disposed 在 0.2.1 极少触发的补位）。 */
+const SWEEP_INTERVAL_MS = 30_000;
 
 export const inject = [
   'sessionPersistence',
@@ -484,22 +486,73 @@ async function settleMembers(ctx, row, memberIds) {
   return settled;
 }
 
-/** 巡检全部行：把不再被占用的待移动成员移入回收站。 */
+/** 检查一行的全部成员：原位日志目录与回收站副本都不存在。 */
+async function allMembersGone(row) {
+  for (const member of row.members) {
+    for (const dir of [member.fromDir, trashSessionDir(member.id)]) {
+      try {
+        await stat(dir);
+        return false; // 任一位置仍存在：未清完
+      } catch {
+        // 不存在 = 已清除
+      }
+    }
+  }
+  return true;
+}
+
+/** 巡检全部行：把不再被占用的待移动成员移入回收站；完成待清除成员的物理删除。 */
 async function sweepPendingMoves(ctx) {
   const state = await loadTrash();
   let dirty = false;
   for (const row of Object.values(state.sessions)) {
+    // 1) pendingMove：日志目录原位 → 回收站。
     const pending = row.pendingMove ?? [];
-    if (pending.length === 0) continue;
-    const ready = pending.filter((id) => !sessionLoaded(ctx, id));
-    if (ready.length === 0) continue;
-    try {
-      const settled = await settleMembers(ctx, row, ready);
-      row.pendingMove = pending.filter((id) => !settled.includes(id));
-      if (row.pendingMove.length === 0) delete row.pendingMove;
-      dirty = true;
-    } catch {
-      // 单行失败留待下一轮巡检；不阻断其它行。
+    if (pending.length > 0) {
+      const ready = pending.filter((id) => !sessionLoaded(ctx, id));
+      if (ready.length > 0) {
+        try {
+          const settled = await settleMembers(ctx, row, ready);
+          row.pendingMove = pending.filter((id) => !settled.includes(id));
+          if (row.pendingMove.length === 0) delete row.pendingMove;
+          dirty = true;
+        } catch {
+          // 单行失败留待下一轮巡检；不阻断其它行。
+        }
+      }
+    }
+    // 2) purgePending：彻底删除时被写句柄锁住的原位日志，agent 卸载后补删。
+    const purgeWait = row.purgePending ?? [];
+    if (purgeWait.length > 0) {
+      const ready = purgeWait.filter((id) => !sessionLoaded(ctx, id));
+      if (ready.length > 0) {
+        const remaining = [];
+        for (const id of purgeWait) {
+          if (!ready.includes(id)) {
+            remaining.push(id);
+            continue;
+          }
+          const member = row.members.find((candidate) => candidate.id === id);
+          const dir = member?.fromDir;
+          if (dir === undefined) continue;
+          try {
+            await fsRetry(() => rm(dir, { recursive: true, force: true }));
+          } catch {
+            remaining.push(id); // 仍被占用：留待下一轮
+          }
+        }
+        if (remaining.length === 0) {
+          delete row.purgePending;
+          // 全部成员的原位日志确认消失后才整行摘除；任何成员目录仍在则保留行。
+          const allGone = await allMembersGone(row);
+          if (allGone) {
+            delete state.sessions[row.id];
+          }
+        } else {
+          row.purgePending = remaining;
+        }
+        dirty = true;
+      }
     }
   }
   if (dirty) {
@@ -704,7 +757,18 @@ async function restoreFromTrash(ctx, persistence, registry, sessionIds) {
   return { results, failures };
 }
 
-/** 彻底删除：回收站目录/原位残留 + 投影缓存 + 回收站行；失败保留行并报告。 */
+/**
+ * 彻底删除：回收站目录/原位残留 + 投影缓存 + 回收站行。
+ *
+ * 「占用」降级为延迟完成而不是错误：DSH 0.2.1 的 agent 在会话打开期间
+ * 常驻（idle 不退出、无空闲卸载，`workspace/session-stop` 只取消回合），
+ * 进程内无法移动其日志目录。因此：
+ *  - 空闲但已加载的成员：进程内可清的（投影缓存、内存卸载、回收站副本）
+ *    立即清；原位日志保留，行标记 `purgePending`，由启动巡检（sweep 的
+ *    purge 分支）在下次 DSH 启动后物理清除。行内 `members` 已带全部
+ *    信息，重启后无需用户再操作。
+ *  - 运行中仍然硬拒绝（用户规则：正在运行的会话不允许彻底删除）。
+ */
 async function purgeFromTrash(ctx, persistence, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
@@ -719,22 +783,23 @@ async function purgeFromTrash(ctx, persistence, sessionIds) {
     if (running.length > 0) {
       throw trashError('SESSION_RUNNING', `会话正在运行，无法彻底删除（运行中的会话：${running.join('、')}）`);
     }
-    const pending = row.pendingMove ?? [];
-    const loadedPending = pending.filter((memberId) => sessionLoaded(ctx, memberId));
-    if (loadedPending.length > 0) {
-      throw trashError(
-        'SESSION_LOADED',
-        `会话仍被占用（已加载，写句柄未释放）：${loadedPending.join('、')}。关闭对应窗口或重启 DSH 后再彻底删除。`,
-      );
-    }
     const rowFailures = [];
+    const deferred = [];
     for (const member of row.members) {
-      // 回收站副本与原位残留都清（pendingMove 成员的文件仍在原位）。
-      for (const dir of [trashSessionDir(member.id), member.fromDir]) {
-        try {
-          await fsRetry(() => rm(dir, { recursive: true, force: true }));
-        } catch (error) {
-          rowFailures.push({ id: member.id, phase: 'purge', path: dir, message: String(error?.message ?? error) });
+      // 回收站副本先清；原位日志可能被写句柄锁住（已加载空闲成员）。
+      try {
+        await fsRetry(() => rm(trashSessionDir(member.id), { recursive: true, force: true }));
+      } catch (error) {
+        rowFailures.push({ id: member.id, phase: 'purge', path: trashSessionDir(member.id), message: String(error?.message ?? error) });
+      }
+      try {
+        await fsRetry(() => rm(member.fromDir, { recursive: true, force: true }));
+      } catch (error) {
+        // EBUSY/EPERM 重试耗尽 = 写句柄未释放：延到下次启动巡检清除。
+        if (['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) {
+          deferred.push(member.id);
+        } else {
+          rowFailures.push({ id: member.id, phase: 'purge', path: member.fromDir, message: String(error?.message ?? error) });
         }
       }
       await removeProjectionCacheRecord(member.id);
@@ -744,8 +809,14 @@ async function purgeFromTrash(ctx, persistence, sessionIds) {
       failures.push(...rowFailures);
       continue; // 保留行：可重试
     }
-    delete state.sessions[id];
-    results.push({ id, ok: true });
+    if (deferred.length > 0) {
+      // 记录待物理清除的成员；行保留（列表里可见），重启后 sweep 清完再删行。
+      row.purgePending = deferred;
+      results.push({ id, ok: true, deferredCount: deferred.length });
+    } else {
+      delete state.sessions[id];
+      results.push({ id, ok: true });
+    }
   }
   await saveTrash(state);
   ctx.emit('session-trash/changed');
@@ -938,6 +1009,16 @@ export async function apply(ctx) {
     }, BOOT_SWEEP_DELAY_MS);
     return () => clearTimeout(timer);
   }, 'session-trash: boot sweep');
+
+  // 2b) 周期兜底巡检：agent/disposed 在 DSH 0.2.1 里很少触发（agent 会话期
+  //     常驻），跨窗口的占用释放只能靠轮询发现。30s 一次，无锁竞争时开销
+  //     可忽略（只读 pendingMove/purgePending 非空的行）。
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      void sweepPendingMoves(ctx).catch(() => { /* 留待下一轮 */ });
+    }, SWEEP_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, 'session-trash: periodic sweep');
 
   // 3) HTTP 路由：浏览器认证复用 connection 服务（Host/Origin + 凭证）。
   ctx.effect(

@@ -50,6 +50,8 @@ window.__ModuleLoader__.load({
       'trash.purgeConfirm': '确认彻底删除？',
       'trash.subCount': '{n} 个子会话',
       'trash.untitled': '未命名会话',
+      'trash.badgeMoving': '待收尾',
+      'trash.badgePurge': '待物理清除',
       'preview.title': '会话预览',
       'preview.close': '关闭',
       'preview.empty': '该会话没有消息。',
@@ -78,6 +80,8 @@ window.__ModuleLoader__.load({
       'trash.purgeConfirm': 'Confirm permanent delete?',
       'trash.subCount': '{n} subagent session(s)',
       'trash.untitled': 'Untitled session',
+      'trash.badgeMoving': 'finishing',
+      'trash.badgePurge': 'purge pending',
       'preview.title': 'Session preview',
       'preview.close': 'Close',
       'preview.empty': 'No messages in this session.',
@@ -119,7 +123,11 @@ window.__ModuleLoader__.load({
   border:1px solid var(--dsw-alias-border-l1);border-radius:10px;
   background:var(--dsw-alias-bg-layer-1)}
 .dst-row-main{flex:1;min-width:0}
-.dst-row-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dst-row-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  display:flex;align-items:center;gap:8px}
+.dst-badge{flex:none;font-size:11px;font-weight:400;padding:1px 8px;border-radius:999px;
+  border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
+.dst-badge-warn{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
 .dst-row-meta{color:var(--dsw-alias-label-secondary);font-size:12px;margin-top:2px}
 .dst-row button{white-space:nowrap}
 .dst-empty{color:var(--dsw-alias-label-secondary);padding:16px 0}
@@ -404,7 +412,11 @@ window.__ModuleLoader__.load({
         rows !== undefined && rows.length === 0 && h('p', { className: 'dst-empty' }, t('trash.empty')),
         rows !== undefined && rows.map((row) => h('div', { className: 'dst-row', key: row.id },
           h('div', { className: 'dst-row-main' },
-            h('div', { className: 'dst-row-title' }, row.title || t('trash.untitled')),
+            h('div', { className: 'dst-row-title' },
+              row.title || t('trash.untitled'),
+              (row.pendingMove?.length ?? 0) > 0 && h('span', { className: 'dst-badge' }, t('trash.badgeMoving')),
+              (row.purgePending?.length ?? 0) > 0 && h('span', { className: 'dst-badge dst-badge-warn' }, t('trash.badgePurge')),
+            ),
             h('div', { className: 'dst-row-meta' },
               `${t('trash.colDeleted')}: ${formatTime(row.deletedAt)}`,
               row.members?.length > 1 ? ` · ${t('trash.subCount', { n: row.members.length - 1 })}` : '',
