@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
 
     const NS = 'session-trash';
-    const inject = ['slots', 'locale', 'sessions', 'layout'];
+    const inject = ['slots', 'locale'];
 
     /** 文案（zh / en 与宿主 locale 服务对齐；key 扁平）。 */
     const zh = {
@@ -221,17 +221,6 @@ window.__ModuleLoader__.load({
     /* ---------------------------------------------------------------- */
     /*  菜单项                                                            */
     /* ---------------------------------------------------------------- */
-
-    /** 当前主视图会话 id（retainedBy.mainView 标记）。 */
-    function currentMainSessionId(ctx) {
-      try {
-        const list = ctx.get('sessions')?.list?.getSnapshot?.();
-        if (list === undefined) return undefined;
-        return list.ids?.find((id) => (list.byId[id]?.retainedBy?.mainView ?? 0) > 0);
-      } catch {
-        return undefined;
-      }
-    }
 
     function DeleteSessionMenuItem({ sessionId, useMenuOpenState, t }) {
       const setMenuOpen = useMenuOpenState?.()[1];

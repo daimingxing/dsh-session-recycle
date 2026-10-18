@@ -20,7 +20,7 @@
  *  - 物理失败不静默吞掉：结果逐条报告 ok/failures，由客户端如实提示。
  */
 import { rm, stat, readFile, writeFile, rename, mkdir, readdir, cp } from 'node:fs/promises';
-import { dirname, join, basename } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { zstdDecompressSync } from 'node:zlib';
