@@ -1,0 +1,50 @@
+{
+  "name": "dsh-session-trash",
+  "version": "0.1.0",
+  "description": "会话回收站：侧边栏删除会话进入回收站，可查看预览、还原或彻底删除 · Session trash for DeepSeek Harness.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "session",
+    "trash",
+    "recycle-bin"
+  ],
+  "dsh": {
+    "displayName": "会话回收站",
+    "description": "会话回收站：侧边栏菜单删除会话进入回收站，回收站里可查看、还原或彻底删除；运行中的会话受保护。",
+    "engines": {
+      "dsh": ">=0.2.1-rc.1 <0.3.0-0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

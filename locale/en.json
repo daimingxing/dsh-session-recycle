@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "title": "Session Trash",
+    "description": "Delete sessions from the sidebar menu into a recycle bin; view, restore, or permanently delete them. Running sessions are protected."
+  },
+  "menu": {
+    "deleteSession": "Delete session"
+  },
+  "toast": {
+    "deleted": "Moved to trash",
+    "undo": "Undo",
+    "restoreDone": "Session restored",
+    "purgeConfirmTitle": "Permanently delete this session?",
+    "purgeConfirmDesc": "“{title}” and all its subagent sessions will be removed from disk. This cannot be undone.",
+    "purge": "Delete permanently",
+    "deleteFailed": "Delete failed: {message}",
+    "restoreFailed": "Restore failed: {message}",
+    "purgeFailed": "Permanent delete failed: {message}",
+    "runningBlocked": "Session is running and cannot be deleted",
+    "previewFailed": "Preview failed: {message}",
+    "loading": "Loading…"
+  },
+  "trash": {
+    "title": "Session Trash",
+    "empty": "Trash is empty",
+    "colSession": "Session",
+    "colDeleted": "Deleted at",
+    "colSub": "Sub-sessions",
+    "view": "View",
+    "restore": "Restore",
+    "purge": "Delete permanently",
+    "subCount": "{n} subagent session(s)",
+    "undoWindow": "You can undo within a few seconds from the toast."
+  },
+  "preview": {
+    "title": "Session preview",
+    "close": "Close",
+    "empty": "No messages in this session."
+  }
+}

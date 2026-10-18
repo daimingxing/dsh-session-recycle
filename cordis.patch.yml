@@ -1,0 +1,7 @@
+# dsh-session-trash bundle patch.
+#
+# 单行 insert 挂载 host 半边（index.js）；浏览器半边经 package.json 的
+# dsh.client + exports["./client"] 自动进入 client 模块图。
+- insert:
+    - id: session-trash
+      name: dsh-session-trash

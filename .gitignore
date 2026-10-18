@@ -1,0 +1,12 @@
+# npm
+node_modules/
+*.tgz
+.npmrc
+
+# 测试与临时产物
+test-out/
+*.log
+
+# 运行期数据（插件自己的目录在 $DSH_HOME 下，不在仓库内，防患未然）
+index.json
+sessions/

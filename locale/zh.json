@@ -1,0 +1,40 @@
+{
+  "meta": {
+    "title": "会话回收站",
+    "description": "从侧边栏菜单把会话删除进回收站；回收站里可查看、还原或彻底删除。运行中的会话受保护。"
+  },
+  "menu": {
+    "deleteSession": "删除会话"
+  },
+  "toast": {
+    "deleted": "已移入回收站",
+    "undo": "撤销",
+    "restoreDone": "会话已还原",
+    "purgeConfirmTitle": "彻底删除此会话？",
+    "purgeConfirmDesc": "“{title}”及其全部子会话将从磁盘移除，此操作不可撤销。",
+    "purge": "彻底删除",
+    "deleteFailed": "删除失败：{message}",
+    "restoreFailed": "还原失败：{message}",
+    "purgeFailed": "彻底删除失败：{message}",
+    "runningBlocked": "会话正在运行，无法删除",
+    "previewFailed": "预览失败：{message}",
+    "loading": "加载中…"
+  },
+  "trash": {
+    "title": "会话回收站",
+    "empty": "回收站是空的",
+    "colSession": "会话",
+    "colDeleted": "删除时间",
+    "colSub": "子会话",
+    "view": "查看会话",
+    "restore": "还原会话",
+    "purge": "彻底删除",
+    "subCount": "{n} 个子会话",
+    "undoWindow": "几秒内可在下方浮层撤销。"
+  },
+  "preview": {
+    "title": "会话预览",
+    "close": "关闭",
+    "empty": "该会话没有消息。"
+  }
+}
