@@ -155,6 +155,13 @@ window.__ModuleLoader__.load({
 .dst-ghost-hint{flex:1;color:var(--dsw-alias-label-secondary);font-size:12px}
 .dst-ghost-list{display:flex;flex-direction:column;gap:8px}
 .dst-ghost-divider{border-top:1px solid var(--dsw-alias-border-l1);margin:6px 0}
+/* 设置导航图标：隐藏壳的默认齿轮，用内联 data-mask 画垃圾桶（currentColor 跟随
+   主题 hover/active）。标记由 MutationObserver 维护（见 apply）。 */
+[data-dsh-session-trash-nav] > svg:first-child{display:none}
+[data-dsh-session-trash-nav]::before{content:'';flex:none;width:16px;height:16px;
+  background:currentColor;
+  -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cline x1='10' y1='11' x2='10' y2='17'/%3E%3Cline x1='14' y1='11' x2='14' y2='17'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6h18'/%3E%3Cpath d='M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6'/%3E%3Cpath d='M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2'/%3E%3Cline x1='10' y1='11' x2='10' y2='17'/%3E%3Cline x1='14' y1='11' x2='14' y2='17'/%3E%3C/svg%3E") center / contain no-repeat}
 .dst-row button{white-space:nowrap}
 .dst-empty{color:var(--dsw-alias-label-secondary);padding:16px 0}
 .dst-menu-item{display:flex;align-items:center;gap:8px;width:100%;border:none;background:none;
@@ -535,6 +542,44 @@ window.__ModuleLoader__.load({
       }, 'session-trash: styles');
 
       const labelTrash = () => t('trash.title');
+
+      /**
+       * 设置导航图标适配：settings.section 的 contract 只投影 id/order/label，
+       * 图标由壳的内置 id 表硬编码（第三方一律齿轮）。与 dsh-better-sidebar
+       * 同款做法——按本地化文案找到自己的 nav 按钮，打 data 标记，由样式表
+       * 的 CSS mask 把齿轮换成垃圾桶（currentColor 跟随主题）。Mutation
+       * 合并到每帧一次；标记只属于本插件，fiber 卸载时移除，HMR 安全。
+       */
+      ctx.effect(() => {
+        const MARKER = 'data-dsh-session-trash-nav';
+        let disposed = false;
+        let frame = null;
+        const sync = () => {
+          if (disposed) return;
+          const currentLabel = labelTrash().trim();
+          const buttons = document.querySelectorAll('[role="dialog"] nav button');
+          for (const button of buttons) {
+            if (currentLabel.length > 0 && button.textContent?.trim() === currentLabel) button.setAttribute(MARKER, '');
+            else button.removeAttribute(MARKER);
+          }
+        };
+        const schedule = () => {
+          if (disposed || frame !== null) return;
+          frame = requestAnimationFrame(() => {
+            frame = null;
+            sync();
+          });
+        };
+        const observer = new MutationObserver(schedule);
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        schedule();
+        return () => {
+          disposed = true;
+          if (frame !== null) cancelAnimationFrame(frame);
+          observer.disconnect();
+          for (const button of document.querySelectorAll(`[${MARKER}]`)) button.removeAttribute(MARKER);
+        };
+      }, 'session-trash: settings nav icon');
 
       ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register(
         {
