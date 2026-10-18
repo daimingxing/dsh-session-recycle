@@ -9,9 +9,11 @@
  *
  * Windows 约束（决定「延迟移动」设计）：
  *  - 目录内任一文件有打开句柄时 rename 失败（EBUSY/EPERM）。已加载的
- *    会话（agents 注册表里有它的 agent，无论是否在运行）持有写句柄，
- *    因此这类成员的物理移动延迟到会话卸载（agent/disposed）或下次启动
- *    巡检时自动完成；期间列表过滤层保证用户不可见。
+ *    会话（agents 注册表里有它的 agent，无论是否在运行）持有写句柄。
+ *    DSH 0.2.1 的 agent 在会话打开期间常驻（idle 不退出，本进程内无自动
+ *    卸载），因此这类成员的物理收尾实际由「下次 DSH 启动的 boot sweep」
+ *    完成，agent/disposed 只是它发生时的即时收尾；期间列表过滤层保证
+ *    用户不可见，回收站行以徽标标注该状态。
  *  - 运行中（agent.status !== 'idle'）的目标树整体拒绝删除（用户规则）。
  *
  * 其余约束：
@@ -43,8 +45,6 @@ const PREVIEW_TAIL = 60;
 const ZSTD_MAGIC = 0xfd2fb528;
 /** 启动巡检延迟毫秒（等服务就绪、会话尚未被打开）。 */
 const BOOT_SWEEP_DELAY_MS = 3000;
-/** 周期兜底巡检间隔毫秒（agent/disposed 在 0.2.1 极少触发的补位）。 */
-const SWEEP_INTERVAL_MS = 30_000;
 
 export const inject = [
   'sessionPersistence',
@@ -993,13 +993,17 @@ export async function apply(ctx) {
   const uninstallFilter = installListFilter(ctx, sessionQuery);
   if (uninstallFilter) ctx.effect(() => uninstallFilter, 'session-trash: listSessions filter');
 
-  // 2) 会话卸载时收尾其待移动成员；启动后巡检一次（重启后仍未移动的）。
+  // 2) 收尾巡检：agent 卸载时 + 启动后各一次。DSH 0.2.1 的 agent 在会话
+  //    打开期间常驻（idle 不退出，本进程内无自动卸载），所以被占用会话的
+  //    物理收尾实际由「下次 DSH 启动的 boot sweep」完成；agent/disposed
+  //    只是它发生时的即时收尾。不做周期轮询（用户偏好：不为删除功能加
+  //    常驻兜底）。
   ctx.on(
     'agent/disposed',
     ({ agent }) => {
       const id = typeof agent?.id === 'string' ? agent.id : undefined;
       if (!id) return;
-      void sweepPendingMoves(ctx).catch(() => { /* 巡检失败留待下一轮 */ });
+      void sweepPendingMoves(ctx).catch(() => { /* 巡检失败留待下次启动 */ });
     },
     { global: true },
   );
@@ -1009,16 +1013,6 @@ export async function apply(ctx) {
     }, BOOT_SWEEP_DELAY_MS);
     return () => clearTimeout(timer);
   }, 'session-trash: boot sweep');
-
-  // 2b) 周期兜底巡检：agent/disposed 在 DSH 0.2.1 里很少触发（agent 会话期
-  //     常驻），跨窗口的占用释放只能靠轮询发现。30s 一次，无锁竞争时开销
-  //     可忽略（只读 pendingMove/purgePending 非空的行）。
-  ctx.effect(() => {
-    const timer = setInterval(() => {
-      void sweepPendingMoves(ctx).catch(() => { /* 留待下一轮 */ });
-    }, SWEEP_INTERVAL_MS);
-    return () => clearInterval(timer);
-  }, 'session-trash: periodic sweep');
 
   // 3) HTTP 路由：浏览器认证复用 connection 服务（Host/Origin + 凭证）。
   ctx.effect(
