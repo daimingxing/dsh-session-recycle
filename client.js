@@ -24,12 +24,13 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
 
     const NS = 'session-trash';
-    const inject = ['slots', 'locale'];
+    const inject = ['slots', 'locale', 'sessions', 'uiWorkspace'];
 
     /** 文案（zh / en 与宿主 locale 服务对齐；key 扁平）。 */
     const zh = {
       'menu.deleteSession': '删除会话',
       'toast.deleted': '已移入回收站',
+      'toast.alreadyTrashed': '该会话已在回收站中',
       'toast.undo': '撤销',
       'toast.restoreDone': '会话已还原',
       'toast.purgeConfirmTitle': '彻底删除此会话？',
@@ -57,6 +58,7 @@ window.__ModuleLoader__.load({
     const en = {
       'menu.deleteSession': 'Delete session',
       'toast.deleted': 'Moved to trash',
+      'toast.alreadyTrashed': 'This session is already in the trash',
       'toast.undo': 'Undo',
       'toast.restoreDone': 'Session restored',
       'toast.purgeConfirmTitle': 'Permanently delete this session?',
@@ -222,6 +224,29 @@ window.__ModuleLoader__.load({
     /*  菜单项                                                            */
     /* ---------------------------------------------------------------- */
 
+    /** 当前主视图会话 id（retainedBy.mainView 标记，与 uiWorkspace 判定一致）。 */
+    function currentMainSessionId(ctx) {
+      try {
+        const list = ctx.get('sessions')?.list?.getSnapshot?.();
+        if (list === undefined) return undefined;
+        return list.ids?.find((id) => (list.byId[id]?.retainedBy?.mainView ?? 0) > 0);
+      } catch {
+        return undefined;
+      }
+    }
+
+    /**
+     * 删除的是主视图会话时把主区切到新会话/空白页：uiWorkspace.startSession()
+     * 无参会在最近工作区开一个 blank 并 replaceMain（DSH 自带归档的 clearMain
+     * 语义在删除场景的等价物）。删的是别的会话时不调用，避免打断当前查看。
+     */
+    function resetMainIfDeleted(ctx, sessionId) {
+      if (currentMainSessionId(ctx) !== sessionId) return;
+      try {
+        ctx.get('uiWorkspace')?.startSession?.();
+      } catch { /* 主区复位失败不影响删除本身 */ }
+    }
+
     function DeleteSessionMenuItem({ sessionId, useMenuOpenState, t }) {
       const setMenuOpen = useMenuOpenState?.()[1];
       const [busy, setBusy] = React.useState(false);
@@ -234,7 +259,14 @@ window.__ModuleLoader__.load({
           setMenuOpen?.(false);
           setBusy(true);
           try {
-            await api('delete', { sessionIds: [sessionId] });
+            const data = await api('delete', { sessionIds: [sessionId] });
+            const result = data?.results?.[0];
+            if (result?.skipped) {
+              // 已在回收站（如残留的过期行再点一次删除）：如实提示，不弹撤销。
+              showToast({ text: t('toast.alreadyTrashed'), holdMs: 3000, onAction: null });
+              return;
+            }
+            resetMainIfDeleted(ctx, sessionId);
             notifyDeleted(t, sessionId, (error) => showToast({
               text: t('toast.restoreFailed', { message: String(error?.message ?? error) }),
               holdMs: 4000,

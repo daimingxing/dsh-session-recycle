@@ -586,10 +586,21 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
   }
 
   if (plans.length === 0) {
-    return { results: roots.map((id) => ({ id, ok: true, skipped: true })), failures: [] };
+    // 幂等跳过要显式告知客户端：这些会话已在回收站里，不是"删除成功"。
+    return { results: roots.map((id) => ({ id, ok: true, skipped: true, alreadyTrashed: true })), failures: [] };
   }
 
-  // 1) 先写回收站索引（可恢复点），再动 DSH 的状态。
+  // 1) 先广播"会话没了"（DSH 自带的 api-session/removed：客户端收到即把
+  //    该行从侧边栏删除——包括它所在的分组，因此不会掉进「未分组」），
+  //    再写回收站索引（可恢复点）。广播后列表立即不可见；随后任何宿主
+  //    侧失败都有回收站行兜底。
+  for (const { row } of plans) {
+    for (const member of row.members) {
+      try {
+        ctx.emit('api-session/removed', member.id);
+      } catch { /* 广播失败不影响删除；下次基线刷新会修正 */ }
+    }
+  }
   for (const { row } of plans) state.sessions[row.id] = row;
   await saveTrash(state);
 
@@ -634,7 +645,7 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
   return { results, failures };
 }
 
-/** 回滚一行未完成的删除：已移入的成员移回原位、重新挂账、删除索引行。 */
+/** 回滚一行未完成的删除：已移入的成员移回原位、重新挂账、删除索引行、广播回归。 */
 async function rollbackDelete(ctx, registry, state, row, failedId) {
   for (const member of row.members) {
     if (member.id === failedId) continue;
@@ -648,6 +659,9 @@ async function rollbackDelete(ctx, registry, state, row, failedId) {
     await reattachAccounting(registry, { ...row, archived: row.archived });
   } catch { /* best effort */ }
   delete state.sessions[row.id];
+  // 广播回归：api-session/added 让客户端把回滚的会话重新画回列表；
+  // 标题由后续基线刷新或还原路径的投影重建补全（回滚是罕见路径）。
+  await notifySessionRestored(ctx, { ...row, members: row.members }).catch(() => { /* best effort */ });
 }
 
 /** 还原：日志目录原路移回 + 重新挂账 + 摘除回收站行；失败保留行并报告。 */
