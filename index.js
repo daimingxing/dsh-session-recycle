@@ -409,21 +409,47 @@ async function reattachAccounting(registry, row) {
 }
 
 /**
- * 还原成功后把会话推回客户端列表：emit 宿主自己的 `api-session/added`。
- * summary 的最小字段集与 api-session-controller 的 summaryFor 对齐
- * （sessionId/updatedAt/agentAvailable/running/blank + header 字段）；
- * 标题等投影由客户端的下一次 baseline 拉取补全。
+ * 还原后重建投影缓存并推送列表通知。
+ *
+ * 删除时清掉了投影缓存记录；不在还原时重建的话，侧边栏会显示「未命名
+ * 会话」，直到点开会话（live title 投影到达）才恢复。这里用投影缓存的
+ * 公开冷读接口 `coldSnapshot` 从日志重放折叠（其写入本身 fail-soft），
+ * 并把折叠出的 title 以 cached 投影块随宿主自己的 `api-session/added`
+ * 推给客户端，还原后标题立即显示。任何一步失败都退回最小 summary——
+ * 行为退化为修复前的「点开后标题恢复」。
  */
-function notifySessionRestored(ctx, row) {
+async function notifySessionRestored(ctx, row) {
+  let summary = {
+    sessionId: row.id,
+    updatedAt: row.createdAt ?? Date.now(),
+    agentAvailable: false,
+    running: false,
+    blank: false,
+    cwd: row.cwd,
+  };
   try {
-    ctx.emit('api-session/added', {
-      sessionId: row.id,
-      updatedAt: row.createdAt ?? Date.now(),
-      agentAvailable: false,
-      running: false,
-      blank: false,
-      cwd: row.cwd,
-    });
+    const cache = ctx.get('sessionProjectionCache');
+    const member = row.members.find((candidate) => candidate.id === row.id) ?? row.members[0];
+    const logFile = await locateLogFile(member.fromDir);
+    if (logFile === undefined) throw new Error('restored log not found');
+    const records = parseLogRecords(await readLogText(logFile));
+    const header = records.find((record) => record?.type === 'session');
+    if (header !== undefined && typeof cache?.coldSnapshot === 'function') {
+      // 日志首行是 header 记录，其余为事件；fold 只接受事件序列。
+      const events = records.filter((record) => record?.type !== 'session');
+      const cut = cache.coldSnapshot(header, 0, events);
+      const values = cut?.values;
+      const title = typeof values?.title === 'string' && values.title.length > 0 ? values.title : undefined;
+      if (title !== undefined) {
+        summary = {
+          ...summary,
+          projections: { kind: 'cached', asOfSeq: cut.asOfSeq ?? -1, values: { title } },
+        };
+      }
+    }
+  } catch { /* 重建失败：退回最小 summary */ }
+  try {
+    ctx.emit('api-session/added', summary);
   } catch { /* 通知失败不影响还原 */ }
 }
 
