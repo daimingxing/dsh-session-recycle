@@ -52,6 +52,15 @@ window.__ModuleLoader__.load({
       'trash.untitled': '未命名会话',
       'trash.badgeMoving': '待收尾',
       'trash.badgePurge': '待物理清除',
+      'ghost.hint': '扫描各工作区里从未说过话的空白会话（侧边栏不显示的残留）',
+      'ghost.scan': '扫描幽灵会话',
+      'ghost.scanning': '扫描中…',
+      'ghost.none': '没有幽灵会话',
+      'ghost.title': '空白会话（0 条消息）',
+      'ghost.created': '创建时间',
+      'ghost.deleteAll': '全部移入回收站（{n}）',
+      'ghost.deleted': '已移入回收站（{n}）',
+      'ghost.scanFailed': '扫描失败：{message}',
       'preview.title': '会话预览',
       'preview.close': '关闭',
       'preview.empty': '该会话没有消息。',
@@ -82,6 +91,15 @@ window.__ModuleLoader__.load({
       'trash.untitled': 'Untitled session',
       'trash.badgeMoving': 'finishing',
       'trash.badgePurge': 'purge pending',
+      'ghost.hint': 'Scan for blank sessions that never received a message (hidden residue in every workspace)',
+      'ghost.scan': 'Scan ghost sessions',
+      'ghost.scanning': 'Scanning…',
+      'ghost.none': 'No ghost sessions',
+      'ghost.title': 'Blank session (0 messages)',
+      'ghost.created': 'Created',
+      'ghost.deleteAll': 'Move all to trash ({n})',
+      'ghost.deleted': 'Moved to trash ({n})',
+      'ghost.scanFailed': 'Scan failed: {message}',
       'preview.title': 'Session preview',
       'preview.close': 'Close',
       'preview.empty': 'No messages in this session.',
@@ -96,9 +114,12 @@ window.__ModuleLoader__.load({
   border:1px solid var(--dsw-alias-border-l1);box-shadow:0 8px 24px rgba(0,0,0,.18);
   font-size:13px;animation:dst-in .18s ease-out}
 @keyframes dst-in{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-.dst-toast button{border:none;background:none;cursor:pointer;font-size:13px;
-  color:var(--dsw-alias-brand-primary);padding:2px 4px}
-.dst-toast button:hover{text-decoration:underline}
+.dst-toast-action{display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:13px;
+  padding:4px 12px;border-radius:7px;
+  color:var(--dsw-alias-bg-overlay);background:var(--dsw-alias-brand-primary);
+  border:1px solid var(--dsw-alias-brand-primary)}
+.dst-toast-action:hover{filter:brightness(1.12)}
+.dst-toast-action svg{flex:none}
 .dst-overlay{position:fixed;inset:0;z-index:900;background:rgba(0,0,0,.35);
   display:flex;align-items:center;justify-content:center}
 .dst-modal{background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);
@@ -129,6 +150,11 @@ window.__ModuleLoader__.load({
   border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
 .dst-badge-warn{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
 .dst-row-meta{color:var(--dsw-alias-label-secondary);font-size:12px;margin-top:2px}
+.dst-ghost-bar{display:flex;align-items:center;gap:10px;padding:10px 12px;
+  border:1px dashed var(--dsw-alias-border-l2);border-radius:10px}
+.dst-ghost-hint{flex:1;color:var(--dsw-alias-label-secondary);font-size:12px}
+.dst-ghost-list{display:flex;flex-direction:column;gap:8px}
+.dst-ghost-divider{border-top:1px solid var(--dsw-alias-border-l1);margin:6px 0}
 .dst-row button{white-space:nowrap}
 .dst-empty{color:var(--dsw-alias-label-secondary);padding:16px 0}
 .dst-menu-item{display:flex;align-items:center;gap:8px;width:100%;border:none;background:none;
@@ -221,10 +247,17 @@ window.__ModuleLoader__.load({
         h('span', null, text),
         onAction !== null && h('button', {
           type: 'button',
+          className: 'dst-toast-action',
           onClick: () => {
             void onAction();
           },
-        }, actionLabel),
+        },
+        h('svg', { viewBox: '0 0 24 24', width: 14, height: 14, 'aria-hidden': true }, h('path', {
+          d: 'M3 12a9 9 0 1 0 2.6-6.4L3 8',
+          fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        }), h('path', { d: 'M3 3v5h5', fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })),
+        actionLabel,
+        ),
       );
     }
 
@@ -407,7 +440,55 @@ window.__ModuleLoader__.load({
         }
       };
 
+      /** 幽灵会话扫描：0 消息的空壳（侧边栏永不显示的残留），一键全部移入回收站。 */
+      const [ghosts, setGhosts] = React.useState(undefined);
+      const [scanning, setScanning] = React.useState(false);
+      const scanGhosts = async () => {
+        setScanning(true);
+        try {
+          const data = await api('ghosts');
+          setGhosts(data.ghosts);
+        } catch (error) {
+          showToast({ text: t('ghost.scanFailed', { message: String(error?.message ?? error) }), holdMs: 4000, onAction: null });
+        } finally {
+          setScanning(false);
+        }
+      };
+      const deleteGhosts = async () => {
+        setBusy(true);
+        try {
+          await api('delete', { sessionIds: ghosts.map((ghost) => ghost.id) });
+          setGhosts(undefined);
+          reload();
+          showToast({ text: t('ghost.deleted', { n: ghosts.length }), holdMs: 2500, onAction: null });
+        } catch (error) {
+          showToast({ text: t('toast.deleteFailed', { message: String(error?.message ?? error) }), holdMs: 4000, onAction: null });
+        } finally {
+          setBusy(false);
+        }
+      };
+
       return h('div', { className: 'dst-section' },
+        // 扫描区：常驻一行说明 + 扫描按钮；扫到结果时列出并可一键清入回收站。
+        h('div', { className: 'dst-ghost-bar' },
+          h('span', { className: 'dst-ghost-hint' }, t('ghost.hint')),
+          h('button', { type: 'button', className: 'dst-btn', disabled: scanning || busy, onClick: () => void scanGhosts() },
+            scanning ? t('ghost.scanning') : t('ghost.scan')),
+        ),
+        ghosts !== undefined && ghosts.length === 0 && h('p', { className: 'dst-empty' }, t('ghost.none')),
+        ghosts !== undefined && ghosts.length > 0 && h('div', { className: 'dst-ghost-list' },
+          ghosts.map((ghost) => h('div', { className: 'dst-row', key: ghost.id },
+            h('div', { className: 'dst-row-main' },
+              h('div', { className: 'dst-row-title' }, t('ghost.title')),
+              h('div', { className: 'dst-row-meta' },
+                `${t('ghost.created')}: ${formatTime(ghost.createdAt)}${ghost.cwd ? ` · ${ghost.cwd}` : ''}`,
+              ),
+            ),
+          )),
+          h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => void deleteGhosts() },
+            t('ghost.deleteAll', { n: ghosts.length })),
+        ),
+        h('div', { className: 'dst-ghost-divider' }),
         rows === undefined && h('p', { className: 'dst-empty' }, '…'),
         rows !== undefined && rows.length === 0 && h('p', { className: 'dst-empty' }, t('trash.empty')),
         rows !== undefined && rows.map((row) => h('div', { className: 'dst-row', key: row.id },

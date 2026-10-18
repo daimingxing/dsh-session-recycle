@@ -572,6 +572,44 @@ async function listTrash() {
 }
 
 /**
+ * 扫描幽灵会话：磁盘上有日志、但折叠后是空会话（0 轮、无任何消息），
+ * 侧边栏因 blank 过滤永不显示的残留。判定与 DSH 的 sessionListMetadata
+ * blank 折叠同语义：日志里除头部外没有任何表面事件（user/assistant/
+ * system/developer 消息、tool 调用），也没有 turn/start。
+ */
+const GHOST_MESSAGE_TYPES = new Set(['user/message', 'assistant/message', 'system/message', 'developer/message', 'tool/call', 'tool/result']);
+
+async function scanGhostSessions(ctx, persistence) {
+  const snapshots = await persistence.list({});
+  const state = await loadTrash();
+  const ghosts = [];
+  for (const snapshot of snapshots) {
+    const id = snapshot?.header?.id;
+    if (typeof id !== 'string') continue;
+    if (state.sessions[id]) continue; // 已在回收站
+    if (runningAgentIds(ctx, [id]).length > 0) continue;
+    // 空会话的日志极小（只有头部一行）；完整解析做最终判定。
+    const found = await persistence.findLog(id);
+    const currentPath = typeof found?.currentPath === 'string' ? found.currentPath : typeof found === 'string' ? found : undefined;
+    if (!currentPath) continue;
+    try {
+      const records = parseLogRecords(await readLogText(currentPath));
+      const hasContent = records.some((record) => GHOST_MESSAGE_TYPES.has(record?.type) || record?.type === 'turn/start');
+      if (hasContent) continue;
+      ghosts.push({
+        id,
+        cwd: snapshot.header.cwd,
+        createdAt: snapshot.header.createdAt,
+        sizeBytes: snapshot.sizeBytes,
+      });
+    } catch {
+      // 日志读不出来不判为幽灵（可能是损坏的正常会话）。
+    }
+  }
+  return { ghosts };
+}
+
+/**
  * 删除（入回收站）：`sessionIds` 为一个或多个根会话，每个连带整棵树。
  * 运行中拒绝；已加载（写句柄未释放）的成员标记 pendingMove 延迟移动，
  * 冷会话立即移动；冷会话移动失败则整行回滚并如实报错。
@@ -1029,6 +1067,10 @@ export async function apply(ctx) {
           try {
             if (req.method === 'GET' && method === 'list') {
               writeJson(res, 200, { ok: true, data: await listTrash() });
+              return;
+            }
+            if (req.method === 'GET' && method === 'ghosts') {
+              writeJson(res, 200, { ok: true, data: await scanGhostSessions(ctx, persistence) });
               return;
             }
             const body = await readJsonBody(req);
