@@ -238,11 +238,11 @@ function withTrashLock(transaction) {
  */
 function normalizeIds(value) {
   if (!Array.isArray(value)) return [];
-  return value.filter((id) => {
+  return [...new Set(value.filter((id) => {
     if (typeof id !== 'string' || id.length === 0) return false;
     if (!UUID_PATTERN.test(id)) throw trashError('BAD_REQUEST', `非法会话 id，已拒绝：${id.slice(0, 64)}`);
     return true;
-  });
+  }))];
 }
 
 /** 抛出带稳定 code 的业务错误，HTTP 层原样透传。 */
@@ -312,17 +312,9 @@ function sessionLoaded(ctx, sessionId) {
  * resume/claim）返回的 handle 被上游丢弃，只保留 `.agent`——不 wrap 就
  * 没有任何途径拿到 `dispose()`，已加载会话的写句柄释放不掉。
  *
- * Cordis 约束（审查 P1-3/P1-4 的修正）：
- *  - 补丁安装在一个**稳定目标对象** `patchTarget` 上（创建一次、之后所有
- *    读写在它上面进行）。真实 Cordis 的服务方法每次属性读取都可能返回
- *    新代理，身份比较 `agents.create === create` 在卸载时不可靠；在自建
- *    的稳定目标上比较恒等，幂等卸载才成立。
- *  - 包装函数用 `function`（非箭头）并在调用时 `original.apply(this, args)`
- *    保留宿主调用方的 receiver——`AgentRegistry.create/resume` 靠调用时的
- *    `this.ctx` 决定 agent 生命周期归属（ownerCtx）；`.bind(agents)` 会把
- *    别人创建的 agent 归到本插件 fiber，插件停用会误释放它们。
- *  - `ctx.effect(cb)` 的 cb 在**安装时**执行，返回的函数才是卸载钩子；
- *    以前把清理逻辑写在 cb 里等于安装即清空。这里正确返回卸载函数。
+ * Cordis 的方法读取可能返回新代理，不能靠函数身份判断是否仍是本包装；
+ * 卸载回写保存的原方法。调用时保留 receiver，避免改变 agent 的生命周期
+ * 归属；effect 在安装时执行，必须返回清理函数才会在卸载时恢复。
  *
  * 降级：`create/resume` 缺失或**不可写**（Object.freeze 等）→ 返回
  * disabled 护栏，删除/还原退回「拒绝已加载会话」，插件启动不受影响。
@@ -331,14 +323,16 @@ function sessionLoaded(ctx, sessionId) {
 function installRuntimeGuard(ctx) {
   const agents = ctx.get('agents');
   if (typeof agents?.create !== 'function' || typeof agents?.resume !== 'function') {
-    return { available: false, handles: new Map(), blocked: new Set() };
+    return { available: false, handles: new Map(), blocked: new Set(), pending: new Set() };
   }
   /** 已截获的 handle：id -> handle（agent/disposed 时清除）。 */
   const handles = new Map();
-  /** 禁止重新加载的会话 id（回收站行 + 删除进行中），由 apply 按索引同步。 */
+  /** 已提交的回收站成员，由索引同步。 */
   const blocked = new Set();
+  // 索引刷新只更新 blocked，不能撤销尚未提交的操作保护。
+  const pending = new Set();
 
-  // 稳定补丁目标：装在这个自建对象上，身份比较与卸载恢复都恒等可靠。
+  // 保存原方法；包装安装在宿主服务上，调用时保留宿主 receiver。
   const patchTarget = { create: agents.create, resume: agents.resume };
 
   const wrap = (methodName) =>
@@ -346,7 +340,7 @@ function installRuntimeGuard(ctx) {
     async function guardedFactory(options) {
       const original = patchTarget[methodName];
       const sessionId = methodName === 'create' ? options?.sessionId : options?.resumeSessionId;
-      if (typeof sessionId === 'string' && blocked.has(sessionId)) {
+      if (typeof sessionId === 'string' && (blocked.has(sessionId) || pending.has(sessionId))) {
         throw trashError('SESSION_TRASHED', `会话 ${sessionId} 在回收站中，已阻止重新加载`);
       }
       const handle = await original.apply(this, arguments);
@@ -355,7 +349,7 @@ function installRuntimeGuard(ctx) {
         handles.set(id, handle);
       }
       // 创建期间被拉黑（删除与打开并发）：立即释放，不让隐藏会话复活。
-      if (typeof id === 'string' && blocked.has(id)) {
+      if (typeof id === 'string' && (blocked.has(id) || pending.has(id))) {
         await handle?.dispose?.().catch(() => {});
         throw trashError('SESSION_TRASHED', `会话 ${id} 在删除期间被阻止加载`);
       }
@@ -374,7 +368,7 @@ function installRuntimeGuard(ctx) {
       if (agents.create === create) agents.create = patchTarget.create;
       if (agents.resume === resume) agents.resume = patchTarget.resume;
     } catch { /* 恢复也失败：留待重装覆盖 */ }
-    return { available: false, handles, blocked, installError: String(error?.message ?? error) };
+    return { available: false, handles, blocked, pending, installError: String(error?.message ?? error) };
   }
 
   ctx.on(
@@ -385,12 +379,7 @@ function installRuntimeGuard(ctx) {
     },
     { global: true },
   );
-  // Cordis effect 语义（复审 P1-1）：传入的回调**在安装时立即执行**，回
-  // 调返回的函数才是卸载钩子。回调本身必须无副作用——上一版把恢复逻辑写
-  // 在回调里，等于安装即撤销包装。这里回调只返回清理函数；清理函数做两
-  // 件事：恢复原始方法 + 清空内存状态。恢复直接写回 patchTarget 保存的原
-  // 始引用（安装时赋值成功过，可写性已验证；不依赖身份比较——宿主代理化
-  // 读取下 `agents.create === create` 不可靠）。
+  // 安装回调只返回清理函数，恢复方法和清空状态都发生在卸载时。
   let uninstalled = false;
   ctx.effect(() => () => {
     if (uninstalled) return; // 幂等：Cordis 可能多次触发
@@ -401,9 +390,10 @@ function installRuntimeGuard(ctx) {
     } catch { /* 只读服务：无法恢复方法，仍清内存状态 */ }
     handles.clear();
     blocked.clear();
+    pending.clear();
   }, 'session-trash: runtime guard');
 
-  return { available: true, handles, blocked };
+  return { available: true, handles, blocked, pending };
 }
 
 /**
@@ -417,6 +407,9 @@ function installRuntimeGuard(ctx) {
 async function releaseLoadedSession(ctx, guard, sessionId) {
   const live = ctx.get('agents')?.get?.(sessionId);
   if (live === undefined) return; // 未加载：无需释放
+  if (live.status !== 'idle') {
+    throw trashError('SESSION_RUNNING', `会话 ${sessionId} 正在运行，无法删除`);
+  }
   const handle = guard.handles.get(sessionId);
   if (handle === undefined || handle.agent !== live) {
     throw trashError('SESSION_LOADED', `会话 ${sessionId} 已加载但无法安全释放（先重启 DSH 再试）`);
@@ -870,17 +863,17 @@ async function snapshotSize(persistence, id) {
  * 的空闲成员经护栏 dispose（释放写句柄，阻止重新加载）；护栏不可用或
  * 释放失败则该行如实报错——不做任何物理动作，回滚只是删索引行。
  *
- * 并发约束：操作互斥（复审 P1-2，与 purge/restore 同一把 per-id 锁，
- * 锁内发现树成员后把锁扩展到整棵树——通过在锁内重新以全树 id 集合再
- * 入锁实现层级获取）；索引写入经 withTrashLock 串行（P1-5）；blocked
- * 保留在树集合确定后立即做（此时已持锁，无并发窗口）。
+ * 删除、还原、彻底删除共用进程内操作队列，覆盖树发现到收尾同步；
+ * pending 阻止宿主加载正在处理的成员，索引刷新不会撤销这层保护。
  */
 async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   const roots = normalizeIds(sessionIds);
   if (roots.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
-  // 先在锁外展开树（只读 lineage，无并发风险——buildLineage 只读持久化
-  // 列表），然后一次获取全部 id 的锁（根 + 成员一起，全序获取防死锁）。
-  // 不做嵌套获取：同一函数里对重叠 id 集合二次加锁 = 自己等自己。
+  return withSessionOps(() => deleteToTrashLocked(ctx, guard, persistence, registry, roots));
+}
+
+/** 队列内展开会话树，避免使用另一操作提交前的成员快照。 */
+async function deleteToTrashLocked(ctx, guard, persistence, registry, roots) {
   const children = await buildLineage(persistence);
   const trees = new Map();
   for (const rootId of roots) {
@@ -888,23 +881,15 @@ async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   }
   const allIds = new Set();
   for (const tree of trees.values()) for (const id of tree) allIds.add(id);
-  return withSessionOps(allIds, () => deleteToTrashLocked(ctx, guard, persistence, registry, roots, trees, allIds));
-}
-
-/** delete 主体（已持有 roots + 全树成员的操作锁）。 */
-async function deleteToTrashLocked(ctx, guard, persistence, registry, roots, trees, allIds) {
-  // blocked 保留（已持锁，无并发窗口）。
-  for (const id of allIds) guard.blocked.add(id);
-  // 运行检查：运行中的树整体拒绝，撤销保留。
-  for (const [rootId, tree] of trees) {
-    const running = runningAgentIds(ctx, tree);
-    if (running.length > 0) {
-      for (const id of allIds) guard.blocked.delete(id);
-      throw trashError('SESSION_RUNNING', `会话正在运行，无法删除（运行中的会话：${running.join('、')}）`);
-    }
-  }
-
+  for (const id of allIds) guard.pending.add(id);
   try {
+    // 运行中的树整体拒绝，收尾统一释放本次操作的保护。
+    for (const tree of trees.values()) {
+      const running = runningAgentIds(ctx, tree);
+      if (running.length > 0) {
+        throw trashError('SESSION_RUNNING', `会话正在运行，无法删除（运行中的会话：${running.join('、')}）`);
+      }
+    }
     const projectionCache = ctx.get('sessionProjectionCache');
     const now = Date.now();
     const plans = [];
@@ -922,7 +907,6 @@ async function deleteToTrashLocked(ctx, guard, persistence, registry, roots, tre
         const live = ctx.get('agents')?.get?.(id);
         if (live === undefined) continue;
         await releaseLoadedSession(ctx, guard, id);
-        releasedIds.push(id);
       }
       const snapshot = await persistence.stat(rootId);
       if (!snapshot) throw trashError('SESSION_NOT_FOUND', `会话不存在：${rootId}`);
@@ -1018,58 +1002,45 @@ async function deleteToTrashLocked(ctx, guard, persistence, registry, roots, tre
     }
     return { results, failures: [] };
   } finally {
-    // 收尾（成功与失败都要）：blocked 的保留语义收敛——按索引重建即为
-    // 终态（成功：新行在 = 保持 blocked；失败：无新行 = 撤销保留）。
-    // 已释放的成员无需恢复（软删除不碰文件，重新打开即重建）。
-    void syncBlockedSoon().catch(() => {});
+    await finishSessionOp(guard, allIds);
   }
 }
 
 /**
- * 会话操作互斥（复审 P1-2）：同一会话 id 的 delete/restore/purge 必须
- * 串行——purge 在锁外做物理删除，并发的 restore 能在删除完成前摘行返回
- * "成功"，purge 拿旧行继续把已还原会话的日志删掉。锁覆盖从状态读取到
- * 物理操作结束的完整周期；索引提交锁（withTrashLock）只解决覆盖问题，
- * 不管操作互斥。
- *
- * 实现：每 id 一个 promise 链（Map<id, Promise>）。`withSessionOps(ids,
- * body)` 先按 id 全序（排序）依次挂到各链尾（全序获取防死锁），全部到
- * 位后执行 body，无论成败按相反顺序释放。空 id 集直接执行。
+ * 会话树可以跨回收站行重叠，完整操作串行才能避免还原成功后被旧 purge
+ * 删除。使用单进程队列，无需逐 id 加锁，也不会因重复 id 等待自身。
  */
-const sessionOpsLocks = new Map();
-
-async function withSessionOps(ids, body) {
-  const sorted = [...ids].sort();
-  if (sorted.length === 0) return body();
-  /** 依次获取：等前一个持有者的链尾，然后把链尾换成自己的释放门。 */
-  const held = [];
-  try {
-    for (const id of sorted) {
-      const previous = sessionOpsLocks.get(id) ?? Promise.resolve();
-      let releaseGate;
-      const gate = new Promise((resolveGate) => { releaseGate = resolveGate; });
-      sessionOpsLocks.set(id, previous.then(() => gate));
-      await previous;
-      held.push({ id, releaseGate });
-    }
-    return await body();
-  } finally {
-    // 按获取的相反顺序释放；链尾指向下一等待者（无等待者时 Map 条目会被
-    // 下一次 withSessionOps 覆盖，不累积）。
-    for (const { releaseGate } of held.reverse()) releaseGate?.();
-  }
+let sessionOpsQueue = Promise.resolve();
+function withSessionOps(body) {
+  const run = sessionOpsQueue.then(body, body);
+  sessionOpsQueue = run.then(() => undefined, () => undefined);
+  return run;
 }
-let syncBlockedQueued = false;
-function syncBlockedSoon() {
-  if (syncBlockedQueued) return Promise.resolve();
-  syncBlockedQueued = true;
-  return Promise.resolve().then(() => {
-    syncBlockedQueued = false;
-    return currentSyncBlocked?.();
+
+/** 与索引提交共用队列，避免较旧的异步读取覆盖较新的保护集合。 */
+function syncBlocked(guard) {
+  return withTrashLock(async () => {
+    const state = await loadTrash();
+    const ids = new Set();
+    for (const row of Object.values(state.sessions)) {
+      ids.add(row.id);
+      for (const member of row.members ?? []) ids.add(member.id);
+    }
+    guard.blocked.clear();
+    for (const id of ids) guard.blocked.add(id);
   });
 }
-/** apply 安装时赋值的 blocked 重算函数（模块级，供 syncBlockedSoon 调用）。 */
-let currentSyncBlocked = null;
+
+async function finishSessionOp(guard, ids) {
+  try {
+    await syncBlocked(guard);
+  } catch {
+    // 索引暂时不可读时保守阻止重载，下一次成功同步会收敛。
+    for (const id of ids) guard.blocked.add(id);
+  } finally {
+    for (const id of ids) guard.pending.delete(id);
+  }
+}
 
 /**
  * 还原：重新挂账 + 摘除回收站行 + 广播回归。
@@ -1092,12 +1063,10 @@ function isAccountingMissing(error) {
 async function restoreFromTrash(ctx, guard, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
-  // 操作互斥（复审 P1-2）：与 purge/delete 同一把 per-id 锁。还原在锁内
-  // 读行、挂账、摘行——并发的 purge 必须等锁，看不到中间态。
-  return withSessionOps(ids, () => restoreFromTrashLocked(ctx, guard, registry, ids));
+  return withSessionOps(() => restoreFromTrashLocked(ctx, guard, registry, ids));
 }
 
-/** restore 主体（已持有 ids 的操作锁）。 */
+/** 还原主体，运行于完整操作队列内。 */
 async function restoreFromTrashLocked(ctx, guard, registry, ids) {
   const results = [];
   const failures = [];
@@ -1126,7 +1095,7 @@ async function restoreFromTrashLocked(ctx, guard, registry, ids) {
     for (const row of restoredRows) notifySessionRestored(ctx, row);
   });
   ctx.emit('session-trash/changed');
-  void syncBlockedSoon().catch(() => {});
+  await syncBlocked(guard);
   if (failures.length > 0) {
     throw trashError('RESTORE_PARTIAL', failures.map((failure) => `${failure.id.slice(0, 20)}…: ${failure.message}`).join('；'));
   }
@@ -1301,7 +1270,7 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
 /**
  * 彻底删除：**两阶段**（审查 P1-7）。
  *
- * 阶段一（全部可逆）：对整棵树做运行检查 + blocked 同步保留 + 护栏释放
+ * 阶段一（全部可逆）：对整棵树做运行检查 + pending 操作保护 + 护栏释放
  * + 硬化校验（路径/类型/白名单——不通过即整体拒绝，此时一个字节未删）。
  * 阶段二（不可逆）：逐成员物理删除。unlink 中途 I/O 失败可能部分成功，
  * 如实报告；行保留可重试（重试对已删成员按已清除收敛）。
@@ -1309,13 +1278,10 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
 async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
-  // 操作互斥（复审 P1-2）：锁住全部请求 id（含将发现的树成员），覆盖
-  // 状态读取 → 预检 → 物理删除 → 索引提交的完整周期。锁内重读索引，
-  // restore 不可能在我们持锁期间摘行。
-  return withSessionOps(ids, () => purgeFromTrashLocked(ctx, guard, registry, ids));
+  return withSessionOps(() => purgeFromTrashLocked(ctx, guard, registry, ids));
 }
 
-/** purge 主体（已持有 ids 的操作锁）。 */
+/** 彻底删除主体，运行于完整操作队列内。 */
 async function purgeFromTrashLocked(ctx, guard, registry, ids) {
   const state = await loadTrash();
   const results = [];
@@ -1336,8 +1302,8 @@ async function purgeFromTrashLocked(ctx, guard, registry, ids) {
   if (running.length > 0) {
     throw trashError('SESSION_RUNNING', `会话正在运行，无法彻底删除（运行中的会话：${running.join('、')}）`);
   }
-  // 2) blocked 同步保留：物理删除开始前，任何并发 resume 在 wrap 入口被拒。
-  for (const memberId of allMemberIds) guard.blocked.add(memberId);
+  // 2) 操作保护：物理删除开始前，任何并发 resume 在 wrap 入口被拒。
+  for (const memberId of allMemberIds) guard.pending.add(memberId);
   try {
     // 3) 运行时释放（整棵树统一做，失败发生在任何删除之前）。
     //    复审 P2-3：sessions 内存表条目可能与 agent 独立存在（agent 已
@@ -1416,8 +1382,7 @@ async function purgeFromTrashLocked(ctx, guard, registry, ids) {
     }
     return { results, failures: [] };
   } finally {
-    // 收敛 blocked（成功的行已摘、失败的行仍在——按索引重建即为终态）。
-    void syncBlockedSoon().catch(() => {});
+    await finishSessionOp(guard, allMemberIds);
   }
 }
 
@@ -1618,25 +1583,11 @@ export async function apply(ctx) {
   const uninstallFilter = installListFilter(ctx, sessionQuery);
   if (uninstallFilter) ctx.effect(() => uninstallFilter, 'session-trash: listSessions filter');
 
-  // 3) v1 → v2 迁移（方案 A：旧回收站数据清空不迁移）+ blocked 集合同步。
-  //    blocked 是护栏的内存 Set（create/resume 热路径不能读盘），内容 =
-  //    回收站索引里的全部 id；任何索引变更事件后重算。安装时同步一次。
-  //    currentSyncBlocked 供操作函数的 syncBlockedSoon 去抖调用。
-  const syncBlocked = async () => {
-    try {
-      const state = await loadTrash();
-      guard.blocked.clear();
-      for (const row of Object.values(state.sessions)) {
-        guard.blocked.add(row.id);
-        for (const member of row.members ?? []) guard.blocked.add(member.id);
-      }
-    } catch { /* 同步失败保留旧集合；下次事件重试 */ }
-  };
-  currentSyncBlocked = syncBlocked;
+  // 3) 索引保护与操作保护分开；事件刷新只同步已提交的回收站成员。
   ctx.on('session-trash/changed', () => {
-    void syncBlocked();
+    void syncBlocked(guard).catch(() => {});
   });
-  await syncBlocked();
+  await syncBlocked(guard);
   void migrateLegacyTrash(ctx).catch(() => { /* 迁移失败不阻断启动 */ });
 
   // 4) HTTP 路由：浏览器认证复用 connection 服务（Host/Origin + 凭证）。

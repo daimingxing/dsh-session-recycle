@@ -67,8 +67,11 @@ dsh plugin --profile <name> add link:/绝对路径/dsh-session-recycle
 ## 🧪 测试
 
 ```bash
+node --test test/operations.test.mjs
 node test/parity.test.mjs
 ```
+
+`operations` 通过实际插件 HTTP 入口和临时会话夹具验证删除、还原、彻底删除及并发保护，不依赖本机会话。`parity` 额外抽样本机真实日志验证目录编码、白名单和多帧解压。
 
 ## 📄 许可证
 
@@ -142,6 +145,7 @@ The only host-method patch is a revocable `sessionQuery.listSessions` filter. Di
 ## 🧪 Test
 
 ```bash
+node --test test/operations.test.mjs
 node test/parity.test.mjs
 ```
 
