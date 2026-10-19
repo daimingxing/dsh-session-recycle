@@ -37,8 +37,10 @@ export const name = 'dsh-session-recycle';
 
 /** HTTP 路由前缀；浏览器侧同源相对路径访问。 */
 const API_PREFIX = '/session-trash/api';
-/** 回收站根目录：索引（v2 起软删除不再有 sessions 子目录）。 */
-const TRASH_ROOT_NAME = 'dsh-session-trash';
+/** 回收站根目录：v2 索引软删除（索引文件 + 无 sessions 子目录）。 */
+const TRASH_ROOT_NAME = 'dsh-session-recycle';
+/** v1 物理移动架构的旧根目录，仅启动迁移时整体清除。 */
+const LEGACY_TRASH_ROOT_NAME = 'dsh-session-trash';
 /** 回收站索引格式版本；2 = 索引软删除（无 fromDir/pendingMove 物理语义）。 */
 const TRASH_VERSION = 2;
 /** 只读预览折叠的末尾表层事件数上限。 */
@@ -95,9 +97,9 @@ function trashHome() {
 function trashIndexPath() {
   return join(trashHome(), 'index.json');
 }
-/** 旧架构（v1 物理移动）的回收站会话目录，仅在启动清理残留时使用。 */
-function legacyTrashSessionsDir() {
-  return join(trashHome(), 'sessions');
+/** 旧架构（v1 物理移动）的根目录，仅在启动清理残留时整体删除。 */
+function legacyTrashHome() {
+  return join(resolveDshHome(), LEGACY_TRASH_ROOT_NAME);
 }
 
 /* ------------------------------------------------------------------ */
@@ -124,7 +126,7 @@ async function loadTrash() {
   try {
     const raw = await readFile(trashIndexPath(), 'utf8');
     const doc = JSON.parse(raw);
-    if (doc?.unit?.name !== 'dsh-session-trash') return { version: TRASH_VERSION, sessions: {} };
+    if (doc?.unit?.name !== 'dsh-session-recycle') return { version: TRASH_VERSION, sessions: {} };
     // v1 索引（物理移动语义）不迁移：条目里的 fromDir 指向早已被搬走的
     // 路径，按 v2 语义解读会误导 purge。启动迁移流程会清掉旧数据。
     if (doc?.version === 1 || doc?.unit?.version === 1) return { version: TRASH_VERSION, sessions: {} };
@@ -140,7 +142,7 @@ async function saveTrash(state) {
   await mkdir(trashHome(), { recursive: true });
   const tmp = join(trashHome(), `.index.${randomUUID()}.tmp`);
   const doc = {
-    unit: { name: 'dsh-session-trash', version: TRASH_VERSION },
+    unit: { name: 'dsh-session-recycle', version: TRASH_VERSION },
     sessions: state.sessions,
   };
   await writeFile(tmp, JSON.stringify(doc, null, 2), 'utf8');
@@ -555,18 +557,12 @@ async function notifySessionRestored(ctx, row) {
 async function migrateLegacyTrash(ctx) {
   let dirty = false;
   const state = await loadTrash();
-  // v1 索引：loadTrash 已把 v1 识别为空，这里只需重写一次落盘清掉旧文件。
+  // v1 索引：路径已随包名迁移（$DSH_HOME/dsh-session-trash → dsh-session-
+  // recycle），旧位置的索引读不到即视为不存在，无需重写。这里只清旧目录。
   try {
-    const raw = JSON.parse(await readFile(trashIndexPath(), 'utf8'));
-    if (raw?.version === 1 || raw?.unit?.version === 1) {
-      await saveTrash(state);
-      dirty = true;
-    }
-  } catch { /* 索引不存在或已损坏：无需清理 */ }
-  // v1 回收站会话目录：整体删除。
-  try {
-    await stat(legacyTrashSessionsDir());
-    await rm(legacyTrashSessionsDir(), { recursive: true, force: true });
+    await stat(legacyTrashHome());
+    // 旧根整体删除（含 v1 的 index.json 与 sessions/）；新根 v2 索引不受影响。
+    await rm(legacyTrashHome(), { recursive: true, force: true });
     dirty = true;
   } catch { /* 不存在 = 干净 */ }
   if (dirty) ctx.emit('session-trash/changed');
