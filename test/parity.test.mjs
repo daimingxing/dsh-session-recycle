@@ -61,7 +61,7 @@ const PURGE_FILE_WHITELIST = [
   /^session\.lock$/,
 ];
 
-const UUID_PATTERN = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UUID_PATTERN = /^(?:session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** purge 白名单判定（fail closed：子目录与陌生文件都拒绝）。 */
 function whitelistedEntry(entry) {
@@ -175,11 +175,14 @@ check('拒绝伪装日志 session.jsonl.exe', whitelistedEntry(mkEntry('session.
 check('拒绝跨代伪造 session.v0.jsonl', whitelistedEntry(mkEntry('session.v0.jsonl')), false);
 check('拒绝 13 位 hex 临时文件', whitelistedEntry(mkEntry('session.jsonl.a1b2c3d4e5f6a.tmp')), false);
 
-// 会话 id 形态校验（jsonl 后端实际为 session-<uuid>）
+// 会话 id 形态校验：主会话 session-<uuid>；subagent 子会话裸 <uuid>（真实
+// 磁盘形态，见 --D-WorkPlace-dsh-plugin-dsh-session-recycle-- 下的目录）
 check('id 接受 session-<uuid>', UUID_PATTERN.test('session-2d590700-52d8-4296-9106-90ab8142962d'), true);
+check('id 接受裸 <uuid>（subagent）', UUID_PATTERN.test('1ad11a89-d6c2-42c9-9fa7-f57b4a6f8591'), true);
 check('id 拒绝路径穿越', UUID_PATTERN.test('../../etc'), false);
 check('id 拒绝大写', UUID_PATTERN.test('session-2D590700-52D8-4296-9106-90AB8142962D'), false);
-check('id 拒绝缺前缀', UUID_PATTERN.test('2d590700-52d8-4296-9106-90ab8142962d'), false);
+check('id 拒绝大写裸 uuid', UUID_PATTERN.test('1AD11A89-D6C2-42C9-9FA7-F57B4A6F8591'), false);
+check('id 拒绝无 uuid 结构的字符串', UUID_PATTERN.test('session-abc'), false);
 check('id 拒绝短 id', UUID_PATTERN.test('abc'), false);
 
 /* ------------------------------------------------------------------ */

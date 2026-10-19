@@ -48,8 +48,12 @@ const TRASH_VERSION = 2;
 const PREVIEW_TAIL = 60;
 /** zstd 帧魔数（小端 0xFD2FB528）。 */
 const ZSTD_MAGIC = 0xfd2fb528;
-/** 会话 id 必须是 `session-<uuid>`（jsonl 后端的实际 id 形态；purge 路径推导的第一道关卡）。 */
-const UUID_PATTERN = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/**
+ * 会话 id 形态：`session-<uuid>`（主会话）或裸 `<uuid>`（subagent 子会话，
+ * 日志头 id 即裸 UUID，目录名 = encodeSegment(id) 恒等）。purge 路径推导
+ * 的第一道关卡；parity 测试对两种形态都有边界用例。
+ */
+const UUID_PATTERN = /^(?:session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /**
  * purge 白名单：JSONL 后端在会话目录里会写的全部文件形态。目录里出现
  * 任何不认识的条目即整体拒绝（fail closed）——插件对它不理解的东西选择
@@ -887,9 +891,9 @@ async function restoreFromTrash(ctx, guard, persistence, registry, sessionIds) {
  * @returns {{purged: true}} 校验与删除全部成功时返回；任何校验失败抛错。
  */
 async function purgeSessionDirectory(sessionId, logDir) {
-  // 1) id 必须是 session-<uuid> 形态（路径穿越的第一道关卡）。
+  // 1) id 必须是 session-<uuid> 或裸 <uuid>（subagent）形态（路径穿越的第一道关卡）。
   if (!UUID_PATTERN.test(sessionId)) {
-    throw trashError('PURGE_REFUSED', `会话 id 不是合法的 session-<uuid> 形态，拒绝删除：${sessionId}`);
+    throw trashError('PURGE_REFUSED', `会话 id 不是合法的 <uuid>/session-<uuid> 形态，拒绝删除：${sessionId}`);
   }
   // 2) 目录名必须严格等于 encodeSegment(sessionId)——路径只能推导，不能传入。
   const expectedName = encodeSegment(sessionId);
@@ -898,11 +902,15 @@ async function purgeSessionDirectory(sessionId, logDir) {
     throw trashError('PURGE_REFUSED', `目录名与会话 id 不匹配，拒绝删除：${dirName} != ${expectedName}`);
   }
   // 3) realpath 检查：解析后必须落在 sessions 根之内。
+  //    目录不存在（ENOENT）不是错误——该成员的日志已被外部清理（或从未
+  //    落盘），痕迹只剩登记项，视为此成员已清除。校验顺序：先 ENOENT
+  //    短路，再做 realpath 包含检查（对存在的目录才有效）。
   const sessionsRoot = join(resolveDshHome(), 'sessions');
   let realDir;
   try {
     realDir = await realpath(logDir);
   } catch (error) {
+    if (error?.code === 'ENOENT') return { purged: true, alreadyGone: true };
     throw trashError('PURGE_REFUSED', `无法解析日志目录，拒绝删除：${logDir}（${String(error?.message ?? error)}）`);
   }
   const realRoot = await realpath(sessionsRoot);
@@ -944,6 +952,7 @@ async function purgeSessionDirectory(sessionId, logDir) {
     await unlink(join(realDir, entry.name));
   }
   await rmdir(realDir);
+  return { purged: true };
 }
 
 /**
