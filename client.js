@@ -467,8 +467,8 @@ window.__ModuleLoader__.load({
        * 幽灵会话扫描：磁盘上有痕迹、但两边都不可见的会话。三类：
        * blank（0 消息空壳）/ orphan（有内容但无记账、父会话不在的残壳）/
        * registry（记账或缓存里挂着 id 但日志已不在的登记幽灵）。
-       * blank/orphan 走删除（入回收站）；registry 幽灵没有会话体，走 purge
-       * 直接清登记残留。
+       * blank/orphan 走删除（入回收站）；registry 幽灵没有会话体，purge
+       * 的无行路径直接清登记残留。
        */
       const [ghosts, setGhosts] = React.useState(undefined);
       const [scanning, setScanning] = React.useState(false);

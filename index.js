@@ -891,6 +891,69 @@ async function restoreFromTrash(ctx, persistence, registry, sessionIds) {
  *    信息，重启后无需用户再操作。
  *  - 运行中仍然硬拒绝（用户规则：正在运行的会话不允许彻底删除）。
  */
+/**
+ * 清除一个会话 id 的全部痕迹（彻底删除的统一编排）。
+ *
+ * 痕迹有五种，各自独立存在；调用方只给 id（和可选的回收站行），这里按
+ * 痕迹是否存在逐项清理——「没有回收站行」不是特例，只是步骤 3-5 无事可
+ * 做。登记幽灵（只有记账/缓存残留）与完整回收站条目因此走同一条路径。
+ *
+ *  1. workspace 记账（sessionIds / 归档集 / 置顶集）——registry 公开 API
+ *  2. 投影缓存记录
+ *  3. 回收站副本（`$DSH_HOME/dsh-session-trash/sessions/<id>/`）
+ *  4. 原位日志目录（row.members[].fromDir；被写句柄锁住时标记 deferred）
+ *  5. 回收站索引行
+ *
+ * 运行中的会话整体拒绝（用户规则）。返回 { deferred, failures }；调用方
+ * 负责 finalize（摘索引行 / 标 purgePending）与持久化。
+ */
+async function cleanSessionTraces(ctx, persistence, registry, id, row) {
+  const running = runningAgentIds(ctx, [id]);
+  if (running.length > 0) {
+    throw trashError('SESSION_RUNNING', `会话正在运行，无法彻底删除（运行中的会话：${running.join('、')}）`);
+  }
+  const failures = [];
+  const deferred = [];
+
+  // 1) 记账摘除（幂等：无记账即无操作）。
+  try {
+    await detachAccounting(registry, [id]);
+  } catch (error) {
+    failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
+  }
+
+  // 2) 投影缓存记录。
+  await removeProjectionCacheRecord(id);
+  detachLiveSession(ctx, id);
+
+  // 3) 回收站副本。
+  try {
+    await fsRetry(() => rm(trashSessionDir(id), { recursive: true, force: true }));
+  } catch (error) {
+    failures.push({ id, phase: 'purge', path: trashSessionDir(id), message: String(error?.message ?? error) });
+  }
+
+  // 4) 原位日志目录——只有回收站行记录过 fromDir 才知道去哪找。
+  const member = row?.members.find((candidate) => candidate.id === id);
+  if (member?.fromDir) {
+    try {
+      await fsRetry(() => rm(member.fromDir, { recursive: true, force: true }));
+    } catch (error) {
+      if (['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) {
+        deferred.push(id);
+      } else {
+        failures.push({ id, phase: 'purge', path: member.fromDir, message: String(error?.message ?? error) });
+      }
+    }
+  }
+
+  return { deferred, failures };
+}
+
+/**
+ * 彻底删除：对每个 id 调 cleanSessionTraces 清全部痕迹；有回收站行的
+ * 在全部成员清完后摘行（部分成员被锁则标 purgePending 由启动巡检收尾）。
+ */
 async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
@@ -898,59 +961,33 @@ async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
   const results = [];
   const failures = [];
   for (const id of ids) {
-    // 登记幽灵（无会话体的记账/缓存残留）走轻量清理：摘记账 + 删投影
-    // 缓存记录。没有日志可删，也不需要在回收站里有行。
-    if (!state.sessions[id]) {
-      try {
-        await detachAccounting(registry, [id]);
-      } catch (error) {
-        failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
-        continue;
-      }
-      await removeProjectionCacheRecord(id);
-      detachLiveSession(ctx, id);
-      results.push({ id, ok: true, residueOnly: true });
-      continue;
-    }
     const row = state.sessions[id];
-    const memberIds = row.members.map((member) => member.id);
+    const memberIds = row ? row.members.map((member) => member.id) : [id];
+    // 多成员行：先对整棵树做运行检查，任一在运行则整行拒绝（与删除对称）。
     const running = runningAgentIds(ctx, memberIds);
     if (running.length > 0) {
       throw trashError('SESSION_RUNNING', `会话正在运行，无法彻底删除（运行中的会话：${running.join('、')}）`);
     }
     const rowFailures = [];
     const deferred = [];
-    // 彻底删除的终点是"零痕迹"：除文件与缓存外，记账（sessionIds 归档/
-    // 置顶集合）也要摘除——否则 id 永远留在 workspace.json，被幽灵扫描
-    // 反复报告。删除（入回收站）时已摘过一次；这里幂等兜底。
-    try {
-      await detachAccounting(registry, memberIds);
-    } catch (error) {
-      failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
-    }
-    for (const member of row.members) {
-      // 回收站副本先清；原位日志可能被写句柄锁住（已加载空闲成员）。
+    for (const memberId of memberIds) {
+      const memberRow = row ?? undefined;
       try {
-        await fsRetry(() => rm(trashSessionDir(member.id), { recursive: true, force: true }));
+        const outcome = await cleanSessionTraces(ctx, persistence, registry, memberId, memberRow);
+        deferred.push(...outcome.deferred);
+        rowFailures.push(...outcome.failures);
       } catch (error) {
-        rowFailures.push({ id: member.id, phase: 'purge', path: trashSessionDir(member.id), message: String(error?.message ?? error) });
+        rowFailures.push({ id: memberId, phase: 'purge', message: String(error?.message ?? error) });
       }
-      try {
-        await fsRetry(() => rm(member.fromDir, { recursive: true, force: true }));
-      } catch (error) {
-        // EBUSY/EPERM 重试耗尽 = 写句柄未释放：延到下次启动巡检清除。
-        if (['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) {
-          deferred.push(member.id);
-        } else {
-          rowFailures.push({ id: member.id, phase: 'purge', path: member.fromDir, message: String(error?.message ?? error) });
-        }
-      }
-      await removeProjectionCacheRecord(member.id);
-      detachLiveSession(ctx, member.id);
     }
     if (rowFailures.length > 0) {
       failures.push(...rowFailures);
       continue; // 保留行：可重试
+    }
+    if (!row) {
+      // 登记幽灵：无行可摘，痕迹已清完。
+      results.push({ id, ok: true, residueOnly: true });
+      continue;
     }
     if (deferred.length > 0) {
       // 记录待物理清除的成员；行保留（列表里可见），重启后 sweep 清完再删行。
