@@ -1,6 +1,6 @@
 {
-  "name": "dsh-session-trash",
-  "version": "0.1.0",
+  "name": "dsh-session-recycle",
+  "version": "0.2.0",
   "description": "会话回收站：侧边栏删除会话进入回收站，可查看预览、还原或彻底删除 · Session trash for DeepSeek Harness.",
   "type": "module",
   "main": "index.js",
@@ -27,7 +27,8 @@
     "cordis",
     "session",
     "trash",
-    "recycle-bin"
+    "recycle-bin",
+    "session-recycle"
   ],
   "dsh": {
     "displayName": "会话回收站",

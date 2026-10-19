@@ -1,50 +1,65 @@
 /**
- * dsh-session-trash — Host 半边。
+ * dsh-session-recycle — Host 半边。
  *
- * 核心语义是「移动」：删除把会话（含整棵子会话树）的日志目录移入
- * `$DSH_HOME/dsh-session-trash/sessions/<id>/`，同时移除投影缓存记录、
- * 从 workspace 记账/归档/置顶集合摘除（registry 公开 API），并卸载内存
- * 会话；`sessionQuery.listSessions` 过滤层让回收站里的会话立即从侧边栏
- * 与搜索消失。还原把目录原路移回并重新挂账；彻底删除物理清除一切。
+ * 核心语义是「索引软删除」：移入回收站只写索引与摘除记账，日志目录保持
+ * 原位不动；还原只删索引行并重新挂账；彻底删除（purge）才是唯一的物理
+ * 删除路径，且经硬化校验（UUID/路径推导、symlink 检查、内容白名单）。
  *
- * Windows 约束（决定「延迟移动」设计）：
- *  - 目录内任一文件有打开句柄时 rename 失败（EBUSY/EPERM）。已加载的
- *    会话（agents 注册表里有它的 agent，无论是否在运行）持有写句柄。
- *    DSH 0.2.1 的 agent 在会话打开期间常驻（idle 不退出，本进程内无自动
- *    卸载），因此这类成员的物理收尾实际由「下次 DSH 启动的 boot sweep」
- *    完成，agent/disposed 只是它发生时的即时收尾；期间列表过滤层保证
- *    用户不可见，回收站行以徽标标注该状态。
- *  - 运行中（agent.status !== 'idle'）的目标树整体拒绝删除（用户规则）。
+ * 为什么软删除：回收站是「可后悔区」，在后悔区里对磁盘做最少的事是安全
+ * 性最高的做法——物理移动的全部失败路径（Windows 写句柄导致的 EBUSY、
+ * 搬一半回滚、还原搬回失败）在回收站阶段不存在。代价（README 已知限制
+ * 已写明）：回收站期间日志仍在 `sessions/` 原位，不认识本索引的其他客
+ * 户端仍会列出它；插件卸载或索引损坏时行会复活。
+ *
+ * 运行时护栏（runtime guard）：wrap `agents.create/resume`，在 factory
+ * 边界截获 `AgentHandle`（`{ agent, dispose }`）。UI 打开会话时返回的
+ * handle 被上游丢弃（dsh-api-session-controller 只取 `.agent`），wrap
+ * 是拿到它的唯一位置。护栏用它做两件事：
+ *  - 删除/还原已加载的空闲会话：主动 `dispose()` 释放写句柄——彻底删除
+ *    因此不再需要重启收尾；
+ *  - 回收站集合里的 id 阻止重新加载（防止隐藏的会话被再次打开继续写）。
+ * wrap 失败（DSH 升级改了 factory 签名）时特性检测降级：wrap 装不上就
+ * 退回「拒绝删除已加载会话」的旧行为，一切功能照常，只是少了主动释放。
  *
  * 其余约束：
- *  - 日志定位只信 `persistence.findLog` / `stat`；还原目标目录按删除时
- *    记录的原路径（fromDir）精确还原，不重算编码。
+ *  - 运行中（agent.status !== 'idle'）的目标树整体拒绝删除（用户规则）。
+ *  - 日志定位只信 `persistence.findLog`；purge 目标目录从 id + 日志头
+ *    cwd 推导（projectKey/encodeSegment），绝不接受外部传入的路径。
  *  - 物理失败不静默吞掉：结果逐条报告 ok/failures，由客户端如实提示。
  */
-import { rm, stat, readFile, writeFile, rename, mkdir, readdir, cp } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { rm, stat, readFile, writeFile, rename, mkdir, readdir, unlink, rmdir, realpath, lstat } from 'node:fs/promises';
+import { dirname, join, relative, isAbsolute, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { zstdDecompressSync } from 'node:zlib';
 
-export const name = 'dsh-session-trash';
+export const name = 'dsh-session-recycle';
 
 /** HTTP 路由前缀；浏览器侧同源相对路径访问。 */
 const API_PREFIX = '/session-trash/api';
-/** 回收站根目录：索引 + 移入的日志目录。 */
+/** 回收站根目录：索引（v2 起软删除不再有 sessions 子目录）。 */
 const TRASH_ROOT_NAME = 'dsh-session-trash';
-/** 回收站索引格式版本。 */
-const TRASH_VERSION = 1;
-/** EBUSY/EPERM 重试上限（Windows 句柄滞留）。 */
-const RM_RETRY_MAX = 5;
-/** 每次重试间隔毫秒。 */
-const RM_RETRY_DELAY_MS = 150;
+/** 回收站索引格式版本；2 = 索引软删除（无 fromDir/pendingMove 物理语义）。 */
+const TRASH_VERSION = 2;
 /** 只读预览折叠的末尾表层事件数上限。 */
 const PREVIEW_TAIL = 60;
 /** zstd 帧魔数（小端 0xFD2FB528）。 */
 const ZSTD_MAGIC = 0xfd2fb528;
-/** 启动巡检延迟毫秒（等服务就绪、会话尚未被打开）。 */
-const BOOT_SWEEP_DELAY_MS = 3000;
+/** 会话 id 必须是 `session-<uuid>`（jsonl 后端的实际 id 形态；purge 路径推导的第一道关卡）。 */
+const UUID_PATTERN = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/**
+ * purge 白名单：JSONL 后端在会话目录里会写的全部文件形态。目录里出现
+ * 任何不认识的条目即整体拒绝（fail closed）——插件对它不理解的东西选择
+ * 拒绝而不是假设可以删；DSH 将来新增文件形态时在此处显式放行。
+ */
+const PURGE_FILE_WHITELIST = [
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl$/,                       // 日志本体（各代）
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl\.zstd$/,                 // zstd 压缩日志（各代）
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl\.[0-9a-f]{12}\.tmp$/,    // 发布中的临时文件
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl\.zstd\.[0-9a-f]{12}\.tmp$/,
+  /^session\.migration\.[0-9a-f]{16}\.jsonl(?:\.zstd)?\.tmp$/, // 迁移临时文件
+  /^session\.lock$/,                                           // 写锁残留
+];
 
 export const inject = [
   'sessionPersistence',
@@ -80,11 +95,9 @@ function trashHome() {
 function trashIndexPath() {
   return join(trashHome(), 'index.json');
 }
-function trashSessionsDir() {
+/** 旧架构（v1 物理移动）的回收站会话目录，仅在启动清理残留时使用。 */
+function legacyTrashSessionsDir() {
   return join(trashHome(), 'sessions');
-}
-function trashSessionDir(id) {
-  return join(trashSessionsDir(), id);
 }
 
 /* ------------------------------------------------------------------ */
@@ -93,16 +106,16 @@ function trashSessionDir(id) {
 
 /** 单条回收站行的形状（全部 plain JSON）。 */
 // {
-//   version: 1,
+//   version: 2,
 //   sessions: {
 //     [rootId]: {
 //       id, title, cwd, createdAt, deletedAt, archived, turns, sizeBytes,
 //       members: [{
 //         id,
-//         fromDir,        // 删除时的原日志目录（还原目标 = 精确原路移回）
-//         cwd,            // 日志头里的 cwd（记账/展示用）
+//         logDir,        // 删除时定位到的日志目录（purge 目标与预览来源；
+//                         //   目录保持原位不动，仅在 purge 时校验后删除）
+//         cwd,           // 日志头里的 cwd（记账/展示用）
 //       }],
-//       pendingMove: string[],  // 仍待物理移动的成员 id（已加载会话）
 //     }
 //   }
 // }
@@ -112,6 +125,9 @@ async function loadTrash() {
     const raw = await readFile(trashIndexPath(), 'utf8');
     const doc = JSON.parse(raw);
     if (doc?.unit?.name !== 'dsh-session-trash') return { version: TRASH_VERSION, sessions: {} };
+    // v1 索引（物理移动语义）不迁移：条目里的 fromDir 指向早已被搬走的
+    // 路径，按 v2 语义解读会误导 purge。启动迁移流程会清掉旧数据。
+    if (doc?.version === 1 || doc?.unit?.version === 1) return { version: TRASH_VERSION, sessions: {} };
     const sessions = typeof doc.sessions === 'object' && doc.sessions !== null ? doc.sessions : {};
     return { version: TRASH_VERSION, sessions };
   } catch {
@@ -167,7 +183,7 @@ function runningAgentIds(ctx, ids) {
 
 /**
  * 会话是否已加载（agents 注册表里存在它的 agent，无论是否在运行）。
- * 已加载 = 写句柄未释放 = Windows 下无法移动其日志目录。
+ * 已加载 = 写句柄在握；护栏可用时先 dispose 再操作，不可用时是拒绝项。
  */
 function sessionLoaded(ctx, sessionId) {
   try {
@@ -178,29 +194,98 @@ function sessionLoaded(ctx, sessionId) {
   }
 }
 
-/** Windows 对刚释放句柄的路径可能短暂 EBUSY/EPERM：有限次重试。 */
-async function fsRetry(operation) {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (attempt >= RM_RETRY_MAX || !['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) throw error;
-      await new Promise((resolve) => setTimeout(resolve, RM_RETRY_DELAY_MS));
+/* ------------------------------------------------------------------ */
+/*  运行时护栏（runtime guard）                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * wrap `agents.create/resume`，在 factory 边界截获 `AgentHandle`
+ * （`{ agent, dispose }`）。
+ *
+ * 为什么必须 wrap：UI 打开会话时（dsh-api-session-controller 的
+ * resume/claim）返回的 handle 被上游丢弃，只保留 `.agent`——不 wrap 就
+ * 没有任何途径拿到 `dispose()`，已加载会话的写句柄释放不掉。wrap 点在
+ * factory 服务对象上，只影响本插件 fiber 存续期内的调用，effect 卸载时
+ * 恢复原方法（幂等：只有仍是自己装的方法才摘除）。
+ *
+ * 降级：宿主若改掉 `create/resume` 签名（可写属性不存在即视为装不上），
+ * 返回 disabled 护栏——删除/还原退回「拒绝已加载会话」行为，其余功能
+ * 不受影响。这是对内部服务的猴子补丁，特性检测必须保守。
+ */
+function installRuntimeGuard(ctx) {
+  const agents = ctx.get('agents');
+  if (typeof agents?.create !== 'function' || typeof agents?.resume !== 'function') {
+    return { available: false, handles: new Map(), blocked: new Set() };
+  }
+  /** 已截获的 handle：id -> dispose（agent/disposed 时清除）。 */
+  const handles = new Map();
+  /** 禁止重新加载的会话 id（回收站行 + purge 进行中），由 apply 按索引同步。 */
+  const blocked = new Set();
+  const originalCreate = agents.create.bind(agents);
+  const originalResume = agents.resume.bind(agents);
+
+  const wrap = (original, idOf) => async function guardedFactory(options) {
+    const sessionId = idOf(options);
+    if (typeof sessionId === 'string' && blocked.has(sessionId)) {
+      throw trashError('SESSION_TRASHED', `会话 ${sessionId} 在回收站中，已阻止重新加载`);
     }
+    const handle = await original(options);
+    const id = handle?.agent?.id ?? sessionId;
+    if (typeof id === 'string' && typeof handle?.dispose === 'function') {
+      handles.set(id, handle);
+    }
+    // 创建期间被拉黑（删除与打开并发）：立即释放，不让隐藏会话复活。
+    if (typeof id === 'string' && blocked.has(id)) {
+      await handle?.dispose?.().catch(() => {});
+      throw trashError('SESSION_TRASHED', `会话 ${id} 在删除期间被阻止加载`);
+    }
+    return handle;
+  };
+  const create = wrap(originalCreate, (options) => options?.sessionId);
+  const resume = wrap(originalResume, (options) => options?.resumeSessionId);
+  agents.create = create;
+  agents.resume = resume;
+
+  ctx.on(
+    'agent/disposed',
+    ({ agent }) => {
+      const id = typeof agent?.id === 'string' ? agent.id : undefined;
+      if (id) handles.delete(id);
+    },
+    { global: true },
+  );
+  ctx.effect(() => {
+    if (agents.create === create) agents.create = originalCreate;
+    if (agents.resume === resume) agents.resume = originalResume;
+    handles.clear();
+    blocked.clear();
+  }, 'session-trash: runtime guard');
+
+  return { available: true, handles, blocked };
+}
+
+/**
+ * 释放一个已加载的空闲会话并验证注册表已清空。
+ *
+ * 护栏截获到的 handle 是唯一安全的释放途径：直接调 registry 私有方法
+ * 会绕过 agent-loop 的 teardown 链（等待在跑回合排干、写句柄关闭、
+ * agent/disposed 广播）。拿不到 handle（会话在插件加载前已打开，或宿主
+ * 改了 handle 形状）就如实抛错——降级为拒绝，绝不半途而废。
+ */
+async function releaseLoadedSession(ctx, guard, sessionId) {
+  const live = ctx.get('agents')?.get?.(sessionId);
+  if (live === undefined) return; // 未加载：无需释放
+  const handle = guard.handles.get(sessionId);
+  if (handle === undefined || handle.agent !== live) {
+    throw trashError('SESSION_LOADED', `会话 ${sessionId} 已加载但无法安全释放（先重启 DSH 再试）`);
+  }
+  await handle.dispose();
+  if (ctx.get('agents')?.get?.(sessionId) !== undefined) {
+    throw trashError('SESSION_LOADED', `会话 ${sessionId} 的运行时实例释放不完整，已停止操作`);
   }
 }
 
-/** 移动一个目录；优先 rename（同盘原子），跨盘回退 cp+rm。 */
-async function moveDirectory(from, to) {
-  await mkdir(dirname(to), { recursive: true });
-  try {
-    await fsRetry(() => rename(from, to));
-  } catch (error) {
-    if (error?.code !== 'EXDEV') throw error;
-    await cp(from, to, { recursive: true });
-    await fsRetry(() => rm(from, { recursive: true, force: true }));
-  }
-}
+
 
 /**
  * 从内存 store 卸载一个已发布的会话（写者随 agent 生命周期关闭；这里
@@ -413,12 +498,11 @@ async function reattachAccounting(registry, row) {
 /**
  * 还原后重建投影缓存并推送列表通知。
  *
- * 删除时清掉了投影缓存记录；不在还原时重建的话，侧边栏会显示「未命名
- * 会话」，直到点开会话（live title 投影到达）才恢复。这里用投影缓存的
- * 公开冷读接口 `coldSnapshot` 从日志重放折叠（其写入本身 fail-soft），
- * 并把折叠出的 title 以 cached 投影块随宿主自己的 `api-session/added`
- * 推给客户端，还原后标题立即显示。任何一步失败都退回最小 summary——
- * 行为退化为修复前的「点开后标题恢复」。
+ * 软删除期间投影缓存记录保留（零文件改动原则），但宿主的 api-session
+ * 基线在删除时已把行移除；还原后立即推送 `api-session/added` 让行回来。
+ * 折叠 title 用 `coldSnapshot` 从日志重放（软删除的 projcache 记录可能
+ * 已被 purge 场景清过，直接重读日志最稳）。任何一步失败都退回最小
+ * summary——行为退化为「点开后标题恢复」。
  */
 async function notifySessionRestored(ctx, row) {
   let summary = {
@@ -432,7 +516,8 @@ async function notifySessionRestored(ctx, row) {
   try {
     const cache = ctx.get('sessionProjectionCache');
     const member = row.members.find((candidate) => candidate.id === row.id) ?? row.members[0];
-    const logFile = await locateLogFile(member.fromDir);
+    // 软删除：日志从未离开原位，按删除时定位的 logDir 读取。
+    const logFile = await locateLogFile(member.logDir);
     if (logFile === undefined) throw new Error('restored log not found');
     const records = parseLogRecords(await readLogText(logFile));
     const header = records.find((record) => record?.type === 'session');
@@ -456,109 +541,35 @@ async function notifySessionRestored(ctx, row) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  延迟移动（已加载会话的物理收尾）                                      */
+/*  旧架构迁移（v1 → v2，方案 A：清空不迁移）                            */
 /* ------------------------------------------------------------------ */
 
 /**
- * 完成一行的待移动成员：把仍在原位的日志目录移入回收站并清投影缓存。
- * 返回实际完成的成员 id 列表。已不在原位的成员视为已完成。
+ * 启动时一次性清理 v1 物理移动架构的遗留：旧回收站会话目录与 v1 索引。
+ *
+ * 用户决策（方案 A）：现存的旧回收站数据不迁移——切换前已把想保留的条
+ * 目还原，剩下的视为可以丢弃。日志目录直接物理删除（它们本来就是被删
+ * 进回收站的东西）；删除失败只清索引行，目录留给用户手工处理，绝不让
+ * 插件因为清理不掉旧垃圾而启动失败。
  */
-async function settleMembers(ctx, row, memberIds) {
-  const settled = [];
-  for (const id of memberIds) {
-    const member = row.members.find((candidate) => candidate.id === id);
-    if (!member) {
-      settled.push(id);
-      continue;
-    }
-    let exists = true;
-    try {
-      await stat(member.fromDir);
-    } catch {
-      exists = false;
-    }
-    if (exists) {
-      await moveDirectory(member.fromDir, trashSessionDir(member.id));
-      await removeProjectionCacheRecord(member.id);
-    }
-    settled.push(id);
-  }
-  return settled;
-}
-
-/** 检查一行的全部成员：原位日志目录与回收站副本都不存在。 */
-async function allMembersGone(row) {
-  for (const member of row.members) {
-    for (const dir of [member.fromDir, trashSessionDir(member.id)]) {
-      try {
-        await stat(dir);
-        return false; // 任一位置仍存在：未清完
-      } catch {
-        // 不存在 = 已清除
-      }
-    }
-  }
-  return true;
-}
-
-/** 巡检全部行：把不再被占用的待移动成员移入回收站；完成待清除成员的物理删除。 */
-async function sweepPendingMoves(ctx) {
-  const state = await loadTrash();
+async function migrateLegacyTrash(ctx) {
   let dirty = false;
-  for (const row of Object.values(state.sessions)) {
-    // 1) pendingMove：日志目录原位 → 回收站。
-    const pending = row.pendingMove ?? [];
-    if (pending.length > 0) {
-      const ready = pending.filter((id) => !sessionLoaded(ctx, id));
-      if (ready.length > 0) {
-        try {
-          const settled = await settleMembers(ctx, row, ready);
-          row.pendingMove = pending.filter((id) => !settled.includes(id));
-          if (row.pendingMove.length === 0) delete row.pendingMove;
-          dirty = true;
-        } catch {
-          // 单行失败留待下一轮巡检；不阻断其它行。
-        }
-      }
+  const state = await loadTrash();
+  // v1 索引：loadTrash 已把 v1 识别为空，这里只需重写一次落盘清掉旧文件。
+  try {
+    const raw = JSON.parse(await readFile(trashIndexPath(), 'utf8'));
+    if (raw?.version === 1 || raw?.unit?.version === 1) {
+      await saveTrash(state);
+      dirty = true;
     }
-    // 2) purgePending：彻底删除时被写句柄锁住的原位日志，agent 卸载后补删。
-    const purgeWait = row.purgePending ?? [];
-    if (purgeWait.length > 0) {
-      const ready = purgeWait.filter((id) => !sessionLoaded(ctx, id));
-      if (ready.length > 0) {
-        const remaining = [];
-        for (const id of purgeWait) {
-          if (!ready.includes(id)) {
-            remaining.push(id);
-            continue;
-          }
-          const member = row.members.find((candidate) => candidate.id === id);
-          const dir = member?.fromDir;
-          if (dir === undefined) continue;
-          try {
-            await fsRetry(() => rm(dir, { recursive: true, force: true }));
-          } catch {
-            remaining.push(id); // 仍被占用：留待下一轮
-          }
-        }
-        if (remaining.length === 0) {
-          delete row.purgePending;
-          // 全部成员的原位日志确认消失后才整行摘除；任何成员目录仍在则保留行。
-          const allGone = await allMembersGone(row);
-          if (allGone) {
-            delete state.sessions[row.id];
-          }
-        } else {
-          row.purgePending = remaining;
-        }
-        dirty = true;
-      }
-    }
-  }
-  if (dirty) {
-    await saveTrash(state);
-    ctx.emit('session-trash/changed');
-  }
+  } catch { /* 索引不存在或已损坏：无需清理 */ }
+  // v1 回收站会话目录：整体删除。
+  try {
+    await stat(legacyTrashSessionsDir());
+    await rm(legacyTrashSessionsDir(), { recursive: true, force: true });
+    dirty = true;
+  } catch { /* 不存在 = 干净 */ }
+  if (dirty) ctx.emit('session-trash/changed');
 }
 
 /* ------------------------------------------------------------------ */
@@ -695,10 +706,12 @@ async function snapshotSize(persistence, id) {
 
 /**
  * 删除（入回收站）：`sessionIds` 为一个或多个根会话，每个连带整棵树。
- * 运行中拒绝；已加载（写句柄未释放）的成员标记 pendingMove 延迟移动，
- * 冷会话立即移动；冷会话移动失败则整行回滚并如实报错。
+ *
+ * 软删除语义：只写索引 + 摘记账 + 广播消失，日志目录原位不动。已加载
+ * 的空闲成员经护栏 dispose（释放写句柄，阻止重新加载）；护栏不可用或
+ * 释放失败则该行如实报错——不做任何物理动作，回滚只是删索引行。
  */
-async function deleteToTrash(ctx, persistence, registry, sessionIds) {
+async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   const roots = normalizeIds(sessionIds);
   if (roots.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
   const state = await loadTrash();
@@ -714,10 +727,19 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
     if (running.length > 0) {
       throw trashError('SESSION_RUNNING', `会话正在运行，无法删除（运行中的会话：${running.join('、')}）`);
     }
+    // 已加载成员：护栏可用时先释放（软删除不动文件，释放是为了阻止
+    // 回收站里的会话被重新打开继续写）；不可用时如实拒绝。
+    const loaded = tree.filter((id) => sessionLoaded(ctx, id));
+    if (loaded.length > 0) {
+      for (const id of loaded) {
+        await releaseLoadedSession(ctx, guard, id);
+      }
+    }
     const snapshot = await persistence.stat(rootId);
     if (!snapshot) throw trashError('SESSION_NOT_FOUND', `会话不存在：${rootId}`);
 
-    // 每个成员定位日志目录并读取头部（fromDir 是还原的精确目标）。
+    // 每个成员定位日志目录并读取头部（logDir 是 purge 与预览的定位依据，
+    // 目录保持原位不动）。
     const members = [];
     let turns = 0;
     for (const id of tree) {
@@ -735,7 +757,7 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
           if (id === rootId) turns = records.filter((record) => record?.type === 'turn/start').length;
         }
       } catch { /* 头部统计失败不阻断删除 */ }
-      members.push({ id, fromDir: dir, cwd: header?.cwd ?? undefined });
+      members.push({ id, logDir: dir, cwd: header?.cwd ?? undefined });
     }
 
     // 标题：投影缓存（与侧边栏同源）→ 空。
@@ -743,7 +765,6 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
     try {
       title = projectionCache?.cachedSnapshot?.(snapshot.header, ['title'])?.values?.title;
     } catch { title = undefined; }
-    const pendingMove = members.filter((member) => sessionLoaded(ctx, member.id)).map((member) => member.id);
     plans.push({
       row: {
         id: rootId,
@@ -753,7 +774,6 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
         deletedAt: now,
         archived: registry.archivedSessionIds?.includes(rootId) ?? false,
         members,
-        ...(pendingMove.length > 0 ? { pendingMove } : {}),
         turns,
         sizeBytes: snapshot.sizeBytes,
       },
@@ -765,10 +785,10 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
     return { results: roots.map((id) => ({ id, ok: true, skipped: true, alreadyTrashed: true })), failures: [] };
   }
 
-  // 1) 先广播"会话没了"（DSH 自带的 api-session/removed：客户端收到即把
-  //    该行从侧边栏删除——包括它所在的分组，因此不会掉进「未分组」），
-  //    再写回收站索引（可恢复点）。广播后列表立即不可见；随后任何宿主
-  //    侧失败都有回收站行兜底。
+  // 软删除唯一的风险是索引与记账写了一半：先广播"会话没了"（DSH 自带的
+  // api-session/removed：客户端把该行从侧边栏删除，不掉进「未分组」），
+  // 再写索引（可恢复点），最后摘记账。任何一步失败都有回收站行兜底——
+  // 行存在即代表"已删除"，恢复入口永远可用。
   for (const { row } of plans) {
     for (const member of row.members) {
       try {
@@ -779,68 +799,32 @@ async function deleteToTrash(ctx, persistence, registry, sessionIds) {
   for (const { row } of plans) state.sessions[row.id] = row;
   await saveTrash(state);
 
-  // 2) 摘除记账 → 卸载内存会话 → 冷成员立即移动；冷成员移动失败则整行回滚。
   const failures = [];
   const results = [];
   for (const { row } of plans) {
     const ids = row.members.map((member) => member.id);
-    const pending = row.pendingMove ?? [];
     try {
       await detachAccounting(registry, ids);
     } catch (error) {
       failures.push({ id: row.id, phase: 'accounting', message: String(error?.message ?? error) });
     }
-    for (const member of row.members) {
-      detachLiveSession(ctx, member.id);
-      if (pending.includes(member.id)) {
-        // 已加载：写句柄未释放，物理移动延迟到会话卸载（agent/disposed）或启动巡检。
-        await removeProjectionCacheRecord(member.id);
-        continue;
-      }
-      try {
-        await moveDirectory(member.fromDir, trashSessionDir(member.id));
-        // 项目目录只剩它时顺带回收（best effort）。
-        try {
-          const projectDir = dirname(member.fromDir);
-          if ((await readdir(projectDir)).length === 0) await rm(projectDir, { recursive: true, force: true });
-        } catch { /* 竞争无碍 */ }
-      } catch (error) {
-        // 冷会话移动失败：回滚整行（移回已移入的成员 + 重新挂账），如实报错。
-        failures.push({ id: member.id, phase: 'move', message: String(error?.message ?? error) });
-        await rollbackDelete(ctx, registry, state, row, member.id);
-        break;
-      }
-      await removeProjectionCacheRecord(member.id);
-    }
     const rowFailed = failures.some((failure) => ids.includes(failure.id));
-    if (!rowFailed) results.push({ id: row.id, ok: true, childCount: row.members.length - 1, pendingMoves: pending.length });
+    if (!rowFailed) results.push({ id: row.id, ok: true, childCount: row.members.length - 1 });
   }
   await saveTrash(state);
   ctx.emit('session-trash/changed');
   return { results, failures };
 }
 
-/** 回滚一行未完成的删除：已移入的成员移回原位、重新挂账、删除索引行、广播回归。 */
-async function rollbackDelete(ctx, registry, state, row, failedId) {
-  for (const member of row.members) {
-    if (member.id === failedId) continue;
-    const target = trashSessionDir(member.id);
-    try {
-      await stat(target);
-      await moveDirectory(target, member.fromDir);
-    } catch { /* 原位不存在即无需回滚 */ }
-  }
-  try {
-    await reattachAccounting(registry, { ...row, archived: row.archived });
-  } catch { /* best effort */ }
-  delete state.sessions[row.id];
-  // 广播回归：api-session/added 让客户端把回滚的会话重新画回列表；
-  // 标题由后续基线刷新或还原路径的投影重建补全（回滚是罕见路径）。
-  await notifySessionRestored(ctx, { ...row, members: row.members }).catch(() => { /* best effort */ });
-}
-
-/** 还原：日志目录原路移回 + 重新挂账 + 摘除回收站行；失败保留行并报告。 */
-async function restoreFromTrash(ctx, persistence, registry, sessionIds) {
+/**
+ * 还原：重新挂账 + 摘除回收站行 + 广播回归。
+ *
+ * 软删除语义下还原没有任何文件操作——日志从未离开原位，还原几乎不会
+ * 失败。日志目录若被外部手段删掉（软删除期间用户手工清理），还原仍然
+ * 成功：行只是登记，不承担"文件还在"的承诺；会话回来后是空壳还是完整
+ * 内容取决于磁盘，与还原动作无关。
+ */
+async function restoreFromTrash(ctx, guard, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
   const state = await loadTrash();
@@ -849,26 +833,8 @@ async function restoreFromTrash(ctx, persistence, registry, sessionIds) {
   for (const id of ids) {
     const row = state.sessions[id];
     if (!row) continue;
-    const rowFailures = [];
-    for (const member of row.members) {
-      const source = trashSessionDir(member.id);
-      let inTrash = true;
-      try {
-        await stat(source);
-      } catch {
-        inTrash = false; // pendingMove 成员仍在原位，无需移动
-      }
-      if (!inTrash) continue;
-      try {
-        await moveDirectory(source, member.fromDir);
-      } catch (error) {
-        rowFailures.push({ id: member.id, phase: 'restore-move', message: String(error?.message ?? error) });
-      }
-    }
-    if (rowFailures.length > 0) {
-      failures.push(...rowFailures);
-      continue; // 保留行：文件仍在回收站，可重试
-    }
+    // 回收站里的会话被护栏阻止重新加载；还原后解除阻止的路径就是摘行
+    // （护栏的阻止集合按行存在性实时查询，无需显式操作）。
     await reattachAccounting(registry, row);
     delete state.sessions[id];
     results.push({ id, ok: true });
@@ -880,81 +846,143 @@ async function restoreFromTrash(ctx, persistence, registry, sessionIds) {
 }
 
 /**
- * 彻底删除：回收站目录/原位残留 + 投影缓存 + 回收站行。
+ * 彻底删除（purge）：软删除架构下唯一的物理删除路径。
  *
- * 「占用」降级为延迟完成而不是错误：DSH 0.2.1 的 agent 在会话打开期间
- * 常驻（idle 不退出、无空闲卸载，`workspace/session-stop` 只取消回合），
- * 进程内无法移动其日志目录。因此：
- *  - 空闲但已加载的成员：进程内可清的（投影缓存、内存卸载、回收站副本）
- *    立即清；原位日志保留，行标记 `purgePending`，由启动巡检（sweep 的
- *    purge 分支）在下次 DSH 启动后物理清除。行内 `members` 已带全部
- *    信息，重启后无需用户再操作。
- *  - 运行中仍然硬拒绝（用户规则：正在运行的会话不允许彻底删除）。
+ * 删除的是 `sessions/` 里 DSH 原本就在写的原始日志目录——stakes 比旧架构
+ * 删"我们搬进去的副本"高得多，因此硬化校验是强制项：
+ *
+ *  1. 路径合法性：id 必须是 UUID；目标目录只能从 id + 日志头 cwd 推导
+ *     （projectKey/encodeSegment），绝不接受请求传入的路径；realpath 后
+ *     必须位于 sessions 根之内。
+ *  2. symlink 检查：目录与自 sessions 根以下的每层祖先都必须是真实目录。
+ *  3. 内容白名单：目录里每个条目都要匹配 JSONL 后端的已知文件形态；出现
+ *     任何陌生文件/子目录即整体拒绝（fail closed），一个字节都不删。
+ *  4. 删除方式：逐文件 unlink + rmdir，不用递归 rm。
+ *
+ * 已加载的空闲成员先经护栏 dispose（释放写句柄后 unlink 才能成功——彻底
+ * 删除因此不再需要重启收尾）；护栏不可用或释放失败则如实拒绝。运行中的
+ * 会话整体拒绝（用户规则）。
  */
+
+/**
+ * 校验并执行一个会话日志目录的硬化删除。
+ * @returns {{purged: true}} 校验与删除全部成功时返回；任何校验失败抛错。
+ */
+async function purgeSessionDirectory(sessionId, logDir) {
+  // 1) id 必须是 session-<uuid> 形态（路径穿越的第一道关卡）。
+  if (!UUID_PATTERN.test(sessionId)) {
+    throw trashError('PURGE_REFUSED', `会话 id 不是合法的 session-<uuid> 形态，拒绝删除：${sessionId}`);
+  }
+  // 2) 目录名必须严格等于 encodeSegment(sessionId)——路径只能推导，不能传入。
+  const expectedName = encodeSegment(sessionId);
+  const dirName = basename(logDir);
+  if (dirName !== expectedName) {
+    throw trashError('PURGE_REFUSED', `目录名与会话 id 不匹配，拒绝删除：${dirName} != ${expectedName}`);
+  }
+  // 3) realpath 检查：解析后必须落在 sessions 根之内。
+  const sessionsRoot = join(resolveDshHome(), 'sessions');
+  let realDir;
+  try {
+    realDir = await realpath(logDir);
+  } catch (error) {
+    throw trashError('PURGE_REFUSED', `无法解析日志目录，拒绝删除：${logDir}（${String(error?.message ?? error)}）`);
+  }
+  const realRoot = await realpath(sessionsRoot);
+  const rel = relative(realRoot, realDir);
+  if (rel === '' || isAbsolute(rel) || rel.startsWith('..')) {
+    throw trashError('PURGE_REFUSED', `日志目录不在 sessions 根内，拒绝删除：${logDir}`);
+  }
+  // 4) symlink 检查：目录自身与每层祖先（至 sessions 根）都必须是真实目录。
+  const checked = new Set();
+  let cursor = realDir;
+  for (;;) {
+    checked.add(cursor);
+    const info = await lstat(cursor);
+    if (!info.isDirectory()) {
+      throw trashError('PURGE_REFUSED', `路径不是真实目录（可能是符号链接），拒绝删除：${cursor}`);
+    }
+    if (cursor === realRoot) break;
+    const parent = dirname(cursor);
+    if (checked.has(parent)) break;
+    cursor = parent;
+  }
+  // 5) 内容白名单：每个条目都必须是已知文件形态；子目录一律拒绝。
+  let entries;
+  try {
+    entries = await readdir(realDir, { withFileTypes: true });
+  } catch (error) {
+    throw trashError('PURGE_REFUSED', `无法列出日志目录，拒绝删除：${logDir}（${String(error?.message ?? error)}）`);
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      throw trashError('PURGE_REFUSED', `目录含未知子目录 "${entry.name}"，拒绝删除（fail closed）`);
+    }
+    if (!PURGE_FILE_WHITELIST.some((pattern) => pattern.test(entry.name))) {
+      throw trashError('PURGE_REFUSED', `目录含未知文件 "${entry.name}"，拒绝删除（fail closed）`);
+    }
+  }
+  // 6) 逐文件 unlink + rmdir（非递归；白名单已保证目录里只有文件）。
+  for (const entry of entries) {
+    await unlink(join(realDir, entry.name));
+  }
+  await rmdir(realDir);
+}
+
 /**
  * 清除一个会话 id 的全部痕迹（彻底删除的统一编排）。
  *
- * 痕迹有五种，各自独立存在；调用方只给 id（和可选的回收站行），这里按
- * 痕迹是否存在逐项清理——「没有回收站行」不是特例，只是步骤 3-5 无事可
+ * 痕迹有四种，各自独立存在；调用方只给 id（和可选的回收站行），这里按
+ * 痕迹是否存在逐项清理——「没有回收站行」不是特例，只是步骤 3-4 无事可
  * 做。登记幽灵（只有记账/缓存残留）与完整回收站条目因此走同一条路径。
  *
- *  1. workspace 记账（sessionIds / 归档集 / 置顶集）——registry 公开 API
- *  2. 投影缓存记录
- *  3. 回收站副本（`$DSH_HOME/dsh-session-trash/sessions/<id>/`）
- *  4. 原位日志目录（row.members[].fromDir；被写句柄锁住时标记 deferred）
- *  5. 回收站索引行
+ *  1. 已加载且空闲：护栏 dispose（失败如实抛错，不继续物理删除）
+ *  2. workspace 记账 + 投影缓存记录
+ *  3. 原位日志目录（row.members[].logDir；硬化校验后删除）
  *
- * 运行中的会话整体拒绝（用户规则）。返回 { deferred, failures }；调用方
- * 负责 finalize（摘索引行 / 标 purgePending）与持久化。
+ * 运行中的会话整体拒绝（用户规则）。
  */
-async function cleanSessionTraces(ctx, persistence, registry, id, row) {
+async function cleanSessionTraces(ctx, guard, registry, id, row) {
   const running = runningAgentIds(ctx, [id]);
   if (running.length > 0) {
     throw trashError('SESSION_RUNNING', `会话正在运行，无法彻底删除（运行中的会话：${running.join('、')}）`);
   }
   const failures = [];
-  const deferred = [];
 
-  // 1) 记账摘除（幂等：无记账即无操作）。
+  // 1) 已加载成员：护栏释放（idle 常驻 agent 的写句柄不释放，unlink 必失败）。
+  try {
+    await releaseLoadedSession(ctx, guard, id);
+  } catch (error) {
+    failures.push({ id, phase: 'release', message: String(error?.message ?? error) });
+    return { failures };
+  }
+
+  // 2) 记账摘除（幂等）+ 投影缓存记录。
   try {
     await detachAccounting(registry, [id]);
   } catch (error) {
     failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
   }
-
-  // 2) 投影缓存记录。
   await removeProjectionCacheRecord(id);
   detachLiveSession(ctx, id);
 
-  // 3) 回收站副本。
-  try {
-    await fsRetry(() => rm(trashSessionDir(id), { recursive: true, force: true }));
-  } catch (error) {
-    failures.push({ id, phase: 'purge', path: trashSessionDir(id), message: String(error?.message ?? error) });
-  }
-
-  // 4) 原位日志目录——只有回收站行记录过 fromDir 才知道去哪找。
+  // 3) 原位日志目录——只有回收站行记录过 logDir 才知道去哪找。
   const member = row?.members.find((candidate) => candidate.id === id);
-  if (member?.fromDir) {
+  if (member?.logDir) {
     try {
-      await fsRetry(() => rm(member.fromDir, { recursive: true, force: true }));
+      await purgeSessionDirectory(id, member.logDir);
     } catch (error) {
-      if (['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code)) {
-        deferred.push(id);
-      } else {
-        failures.push({ id, phase: 'purge', path: member.fromDir, message: String(error?.message ?? error) });
-      }
+      failures.push({ id, phase: 'purge', path: member.logDir, message: String(error?.message ?? error) });
     }
   }
 
-  return { deferred, failures };
+  return { failures };
 }
 
 /**
- * 彻底删除：对每个 id 调 cleanSessionTraces 清全部痕迹；有回收站行的
- * 在全部成员清完后摘行（部分成员被锁则标 purgePending 由启动巡检收尾）。
+ * 彻底删除：对每个 id 调 cleanSessionTraces 清全部痕迹；有回收站行的在
+ * 全部成员清完后摘行。任一成员失败即保留整行（可重试）。
  */
-async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
+async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
   const state = await loadTrash();
@@ -969,12 +997,9 @@ async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
       throw trashError('SESSION_RUNNING', `会话正在运行，无法彻底删除（运行中的会话：${running.join('、')}）`);
     }
     const rowFailures = [];
-    const deferred = [];
     for (const memberId of memberIds) {
-      const memberRow = row ?? undefined;
       try {
-        const outcome = await cleanSessionTraces(ctx, persistence, registry, memberId, memberRow);
-        deferred.push(...outcome.deferred);
+        const outcome = await cleanSessionTraces(ctx, guard, registry, memberId, row ?? undefined);
         rowFailures.push(...outcome.failures);
       } catch (error) {
         rowFailures.push({ id: memberId, phase: 'purge', message: String(error?.message ?? error) });
@@ -989,14 +1014,8 @@ async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
       results.push({ id, ok: true, residueOnly: true });
       continue;
     }
-    if (deferred.length > 0) {
-      // 记录待物理清除的成员；行保留（列表里可见），重启后 sweep 清完再删行。
-      row.purgePending = deferred;
-      results.push({ id, ok: true, deferredCount: deferred.length });
-    } else {
-      delete state.sessions[id];
-      results.push({ id, ok: true });
-    }
+    delete state.sessions[id];
+    results.push({ id, ok: true });
   }
   await saveTrash(state);
   ctx.emit('session-trash/changed');
@@ -1010,14 +1029,11 @@ async function previewFromTrash(sessionId) {
   const state = await loadTrash();
   const row = state.sessions[sessionId];
   if (!row) throw trashError('NOT_IN_TRASH', `会话不在回收站：${sessionId}`);
-  const logFile = await locateLogFile(trashSessionDir(sessionId));
-  if (logFile === undefined) {
-    // pendingMove 成员的日志仍在原位：直接从原位读（只读）。
-    const member = row.members.find((candidate) => candidate.id === sessionId);
-    const fallback = member ? await locateLogFile(member.fromDir) : undefined;
-    if (fallback === undefined) throw trashError('LOG_MISSING', '找不到该会话的日志');
-    return summarizePreview(row, sessionId, fallback);
-  }
+  // 软删除：日志仍在原位，按删除时定位的 logDir 只读读取。
+  const member = row.members.find((candidate) => candidate.id === sessionId);
+  if (member?.logDir === undefined) throw trashError('LOG_MISSING', '该会话没有日志目录');
+  const logFile = await locateLogFile(member.logDir);
+  if (logFile === undefined) throw trashError('LOG_MISSING', '找不到该会话的日志');
   return summarizePreview(row, sessionId, logFile);
 }
 
@@ -1081,7 +1097,7 @@ function truncate(text) {
 
 /**
  * 在本 fiber 上包一层 `sessionQuery.listSessions`，把回收站里的 id 从权威
- * 会话列表过滤掉（含 pendingMove 成员——文件尚未移动但已逻辑删除）。
+ * 会话列表过滤掉（软删除：文件在原位但已逻辑删除）。
  * 卸载时恢复原方法。
  */
 function installListFilter(ctx, sessionQuery) {
@@ -1169,32 +1185,34 @@ export async function apply(ctx) {
   const registry = ctx.workspaceRegistry;
   const webServer = ctx.webServer;
 
-  // 1) 会话列表过滤（唯一补丁点，可撤销）。
+  // 1) 运行时护栏：截获 AgentHandle（dispose 能力）+ 阻止回收站重载。
+  //    内部方法补丁，特性检测失败自动降级（删除退回拒绝已加载会话）。
+  const guard = installRuntimeGuard(ctx);
+
+  // 2) 会话列表过滤（唯一宿主方法补丁，可撤销）。
   const uninstallFilter = installListFilter(ctx, sessionQuery);
   if (uninstallFilter) ctx.effect(() => uninstallFilter, 'session-trash: listSessions filter');
 
-  // 2) 收尾巡检：agent 卸载时 + 启动后各一次。DSH 0.2.1 的 agent 在会话
-  //    打开期间常驻（idle 不退出，本进程内无自动卸载），所以被占用会话的
-  //    物理收尾实际由「下次 DSH 启动的 boot sweep」完成；agent/disposed
-  //    只是它发生时的即时收尾。不做周期轮询（用户偏好：不为删除功能加
-  //    常驻兜底）。
-  ctx.on(
-    'agent/disposed',
-    ({ agent }) => {
-      const id = typeof agent?.id === 'string' ? agent.id : undefined;
-      if (!id) return;
-      void sweepPendingMoves(ctx).catch(() => { /* 巡检失败留待下次启动 */ });
-    },
-    { global: true },
-  );
-  ctx.effect(() => {
-    const timer = setTimeout(() => {
-      void sweepPendingMoves(ctx).catch(() => { /* 留待 agent/disposed */ });
-    }, BOOT_SWEEP_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, 'session-trash: boot sweep');
+  // 3) v1 → v2 迁移（方案 A：旧回收站数据清空不迁移）+ blocked 集合同步。
+  //    blocked 是护栏的内存 Set（create/resume 热路径不能读盘），内容 =
+  //    回收站索引里的全部 id；任何索引变更事件后重算。安装时同步一次。
+  const syncBlocked = async () => {
+    try {
+      const state = await loadTrash();
+      guard.blocked.clear();
+      for (const row of Object.values(state.sessions)) {
+        guard.blocked.add(row.id);
+        for (const member of row.members ?? []) guard.blocked.add(member.id);
+      }
+    } catch { /* 同步失败保留旧集合；下次事件重试 */ }
+  };
+  ctx.on('session-trash/changed', () => {
+    void syncBlocked();
+  });
+  await syncBlocked();
+  void migrateLegacyTrash(ctx).catch(() => { /* 迁移失败不阻断启动 */ });
 
-  // 3) HTTP 路由：浏览器认证复用 connection 服务（Host/Origin + 凭证）。
+  // 4) HTTP 路由：浏览器认证复用 connection 服务（Host/Origin + 凭证）。
   ctx.effect(
     () =>
       webServer.register({
@@ -1218,17 +1236,17 @@ export async function apply(ctx) {
             const body = await readJsonBody(req);
             switch (method) {
               case 'delete': {
-                const data = await deleteToTrash(ctx, persistence, registry, body.sessionIds);
+                const data = await deleteToTrash(ctx, guard, persistence, registry, body.sessionIds);
                 writeJson(res, 200, { ok: true, data });
                 return;
               }
               case 'restore': {
-                const data = await restoreFromTrash(ctx, persistence, registry, body.sessionIds);
+                const data = await restoreFromTrash(ctx, guard, persistence, registry, body.sessionIds);
                 writeJson(res, 200, { ok: true, data });
                 return;
               }
               case 'purge': {
-                const data = await purgeFromTrash(ctx, persistence, registry, body.sessionIds);
+                const data = await purgeFromTrash(ctx, guard, persistence, registry, body.sessionIds);
                 writeJson(res, 200, { ok: true, data });
                 return;
               }

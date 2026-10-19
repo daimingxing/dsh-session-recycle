@@ -1,13 +1,15 @@
 /**
- * dsh-session-trash 核心路径的独立验证。
+ * dsh-session-recycle 核心路径的独立验证。
  *
- * 不依赖宿主：验证三类最容易出错的纯函数——
- *  1. projectKey/encodeSegment 与 jsonl 后端落盘目录名的逐字节一致；
- *  2. zstd 连接帧扫描 + 逐帧解压对真实会话日志（多帧）成立；
- *  3. JSONL 头部解析与会话头字段读取成立。
+ * 不依赖宿主：验证软删除架构下最容易出错的纯逻辑——
+ *  1. projectKey/encodeSegment 与 jsonl 后端落盘目录名的逐字节一致
+ *     （purge 的"路径只能推导"校验依赖这一致性）；
+ *  2. purge 白名单正则：JSONL 后端全部已知文件形态放行，陌生文件拒绝；
+ *  3. purge 路径校验语义：UUID 检查、目录名 === encodeSegment(id)；
+ *  4. zstd 连接帧扫描 + 逐帧解压对真实会话日志（多帧）成立。
  */
 import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { zstdDecompressSync } from 'node:zlib';
 
 const SESSIONS_ROOT = process.env.DSH_TEST_SESSIONS_ROOT ?? join(process.env.USERPROFILE, '.dsh', 'sessions');
@@ -47,6 +49,24 @@ function projectKey(cwd) {
     }
   }
   return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`;
+}
+
+/** purge 白名单（与 index.js 的 PURGE_FILE_WHITELIST 同步拷贝）。 */
+const PURGE_FILE_WHITELIST = [
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl$/,
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl\.zstd$/,
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl\.[0-9a-f]{12}\.tmp$/,
+  /^session(?:\.v[1-9][0-9]*)?\.jsonl\.zstd\.[0-9a-f]{12}\.tmp$/,
+  /^session\.migration\.[0-9a-f]{16}\.jsonl(?:\.zstd)?\.tmp$/,
+  /^session\.lock$/,
+];
+
+const UUID_PATTERN = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** purge 白名单判定（fail closed：子目录与陌生文件都拒绝）。 */
+function whitelistedEntry(entry) {
+  if (entry.isDirectory()) return false;
+  return PURGE_FILE_WHITELIST.some((pattern) => pattern.test(entry.name));
 }
 
 function scanZstdFrames(buffer, maxFrames = Number.POSITIVE_INFINITY) {
@@ -102,7 +122,7 @@ function readLogText(bytes, isZstd) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  1. 目录名一致性                                                      */
+/*  1. 目录名一致性（purge 推导校验的基础）                               */
 /* ------------------------------------------------------------------ */
 
 let failures = 0;
@@ -116,27 +136,54 @@ for (const projectDir of readdirSync(SESSIONS_ROOT, { withFileTypes: true })) {
   if (!projectDir.isDirectory()) continue;
   const name = projectDir.name;
   if (name === '_no-cwd') continue;
-  // 从真实目录名反推 projectKey 的输出形态：`--D-WorkPlace-…--`。
-  // 直接验证我们的 projectKey 对同一路径生成同一目录名：
-  // 目录名去掉首尾 `--` 后，把 `-` 还原为分隔符仅对纯 ASCII 段可靠；
-  // 这里验证正向：真实 cwd → 目录名（逐字节比对目录树）。
   for (const sessionDir of readdirSync(join(SESSIONS_ROOT, name), { withFileTypes: true })) {
     if (!sessionDir.isDirectory()) continue;
-    const headerFile = join(SESSIONS_ROOT, name, sessionDir.name);
+    const dir = join(SESSIONS_ROOT, name, sessionDir.name);
     // 读日志头部拿 cwd，再用 projectKey 重算目录名比对。
-    const logName = readdirSync(headerFile).find((entry) => entry.startsWith('session') && entry.includes('.jsonl'));
+    const logName = readdirSync(dir).find((entry) => entry.startsWith('session') && entry.includes('.jsonl'));
     if (!logName) continue;
-    const bytes = readFileSync(join(headerFile, logName));
+    const bytes = readFileSync(join(dir, logName));
     const text = readLogText(bytes, logName.endsWith('.zstd'));
     const header = JSON.parse(text.slice(0, text.indexOf('\n') === -1 ? undefined : text.indexOf('\n')));
     check(`projectKey(${header.cwd})`, projectKey(header.cwd), name);
     check(`encodeSegment(${header.id})`, encodeSegment(header.id), sessionDir.name);
+    // purge 推导校验语义：basename(目录) 必须等于 encodeSegment(header.id)。
+    check(`purge-derive(${basename(dir)})`, basename(dir) === encodeSegment(header.id), true);
+    // 真实日志文件全部命中白名单（fail closed 不误伤正常数据）。
+    const allWhitelisted = readdirSync(dir, { withFileTypes: true }).every(whitelistedEntry);
+    check(`purge-whitelist(${sessionDir.name.slice(0, 13)}…) 全部文件放行`, allWhitelisted, true);
     break; // 每个项目目录验证一个会话即可
   }
 }
 
 /* ------------------------------------------------------------------ */
-/*  2. 多帧 zstd 日志全量解压                                            */
+/*  2. 白名单边界：陌生文件/子目录必须拒绝                                */
+/* ------------------------------------------------------------------ */
+
+const mkEntry = (name, isDirectory = false) => ({ name, isDirectory: () => isDirectory });
+check('白名单放行 session.jsonl', whitelistedEntry(mkEntry('session.jsonl')), true);
+check('白名单放行 session.v3.jsonl.zstd', whitelistedEntry(mkEntry('session.v3.jsonl.zstd')), true);
+check('白名单放行发布临时文件', whitelistedEntry(mkEntry('session.jsonl.a1b2c3d4e5f6.tmp')), true);
+check('白名单放行 zstd 发布临时文件', whitelistedEntry(mkEntry('session.v2.jsonl.zstd.001122334455.tmp')), true);
+check('白名单放行迁移临时文件', whitelistedEntry(mkEntry('session.migration.0123456789abcdef.jsonl.tmp')), true);
+check('白名单放行 zstd 迁移临时文件', whitelistedEntry(mkEntry('session.migration.0123456789abcdef.jsonl.zstd.tmp')), true);
+check('白名单放行 session.lock', whitelistedEntry(mkEntry('session.lock')), true);
+check('拒绝陌生文件 notes.txt', whitelistedEntry(mkEntry('notes.txt')), false);
+check('拒绝附件目录 attachments/', whitelistedEntry(mkEntry('attachments', true)), false);
+check('拒绝子目录 any/', whitelistedEntry(mkEntry('any', true)), false);
+check('拒绝伪装日志 session.jsonl.exe', whitelistedEntry(mkEntry('session.jsonl.exe')), false);
+check('拒绝跨代伪造 session.v0.jsonl', whitelistedEntry(mkEntry('session.v0.jsonl')), false);
+check('拒绝 13 位 hex 临时文件', whitelistedEntry(mkEntry('session.jsonl.a1b2c3d4e5f6a.tmp')), false);
+
+// 会话 id 形态校验（jsonl 后端实际为 session-<uuid>）
+check('id 接受 session-<uuid>', UUID_PATTERN.test('session-2d590700-52d8-4296-9106-90ab8142962d'), true);
+check('id 拒绝路径穿越', UUID_PATTERN.test('../../etc'), false);
+check('id 拒绝大写', UUID_PATTERN.test('session-2D590700-52D8-4296-9106-90AB8142962D'), false);
+check('id 拒绝缺前缀', UUID_PATTERN.test('2d590700-52d8-4296-9106-90ab8142962d'), false);
+check('id 拒绝短 id', UUID_PATTERN.test('abc'), false);
+
+/* ------------------------------------------------------------------ */
+/*  3. 多帧 zstd 日志全量解压                                            */
 /* ------------------------------------------------------------------ */
 
 let multiFrameTested = 0;

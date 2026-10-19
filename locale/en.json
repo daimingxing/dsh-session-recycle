@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Session Trash",
-    "description": "Delete sessions from the sidebar menu into a recycle bin; view, restore, or permanently delete them. Running sessions are protected."
+    "description": "Delete sessions from the sidebar menu into a recycle bin; view, restore, or permanently delete them. Trashed sessions cannot be reloaded; permanent delete purges every trace."
   },
   "menu": {
     "deleteSession": "Delete session"

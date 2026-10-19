@@ -1,5 +1,5 @@
 /**
- * dsh-session-trash — 浏览器半边。
+ * dsh-session-recycle — 浏览器半边。
  *
  * 三块 UI，全部经 slots 注册到宿主声明过的槽位：
  *  1. `sidebar.workspaces.session.menu.item` order 900：「删除会话」红字菜单项
@@ -18,7 +18,7 @@
  *    非 static 路径转发到 Host；写操作无需 CSRF 头（connection 已认证）。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-session-trash',
+  id: 'dsh-session-recycle',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -50,8 +50,6 @@ window.__ModuleLoader__.load({
       'trash.purgeConfirm': '确认彻底删除？',
       'trash.subCount': '{n} 个子会话',
       'trash.untitled': '未命名会话',
-      'trash.badgeMoving': '待收尾',
-      'trash.badgePurge': '待物理清除',
       'ghost.hint': '扫描磁盘上有痕迹、但两边都不可见的会话：空壳（0 消息）、孤儿残壳（有内容却无归属）、登记幽灵（记账/缓存残留）',
       'ghost.scan': '扫描幽灵会话',
       'ghost.scanning': '扫描中…',
@@ -95,8 +93,6 @@ window.__ModuleLoader__.load({
       'trash.purgeConfirm': 'Confirm permanent delete?',
       'trash.subCount': '{n} subagent session(s)',
       'trash.untitled': 'Untitled session',
-      'trash.badgeMoving': 'finishing',
-      'trash.badgePurge': 'purge pending',
       'ghost.hint': 'Scan for sessions that exist on disk but are invisible on both sides: blank shells (0 messages), orphaned logs with content but no accounting, and registry/cache residue',
       'ghost.scan': 'Scan ghost sessions',
       'ghost.scanning': 'Scanning…',
@@ -158,9 +154,6 @@ window.__ModuleLoader__.load({
 .dst-row-main{flex:1;min-width:0}
 .dst-row-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   display:flex;align-items:center;gap:8px}
-.dst-badge{flex:none;font-size:11px;font-weight:400;padding:1px 8px;border-radius:999px;
-  border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}
-.dst-badge-warn{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
 .dst-row-meta{color:var(--dsw-alias-label-secondary);font-size:12px;margin-top:2px}
 .dst-ghost-bar{display:flex;align-items:center;gap:10px;padding:10px 12px;
   border:1px dashed var(--dsw-alias-border-l2);border-radius:10px}
@@ -568,8 +561,6 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dst-row-main' },
             h('div', { className: 'dst-row-title' },
               row.title || t('trash.untitled'),
-              (row.pendingMove?.length ?? 0) > 0 && h('span', { className: 'dst-badge' }, t('trash.badgeMoving')),
-              (row.purgePending?.length ?? 0) > 0 && h('span', { className: 'dst-badge dst-badge-warn' }, t('trash.badgePurge')),
             ),
             h('div', { className: 'dst-row-meta' },
               `${t('trash.colDeleted')}: ${formatTime(row.deletedAt)}`,
