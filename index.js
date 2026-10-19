@@ -572,41 +572,113 @@ async function listTrash() {
 }
 
 /**
- * 扫描幽灵会话：磁盘上有日志、但折叠后是空会话（0 轮、无任何消息），
- * 侧边栏因 blank 过滤永不显示的残留。判定与 DSH 的 sessionListMetadata
- * blank 折叠同语义：日志里除头部外没有任何表面事件（user/assistant/
- * system/developer 消息、tool 调用），也没有 turn/start。
+ * 幽灵会话扫描：磁盘上留有痕迹、但两边都不可见的会话——不在侧边栏（任何
+ * 档位）、也不在回收站。按"不可见的原因"正向枚举三类：
+ *
+ *  a. 空壳日志：有日志但 0 消息（blank 过滤永不显示）。判定与 DSH 的
+ *     sessionListMetadata blank 折叠同语义：除头部外没有任何消息/工具/
+ *     turn 事件。
+ *  b. 孤儿日志：有日志、有内容，但 workspace 记账里没有它、也不是任何
+ *     现存会话的 subagent 子会话（父会话被外部手段删除后留下的残壳）。
+ *     DSH 的列表按记账分组渲染，这类行只会在「未分组」出现——若它同时
+ *     被宿主的头部校验排除（cwd 无法解析等）则彻底不可见。
+ *  c. 记账/缓存幽灵：workspace.json 或投影缓存里挂着 id，但日志已不在
+ *     （外部删除/历史残留）。这类没有会话体，只能从登记侧发现。
+ *
+ * subagent 子会话（origin=subagent 且父会话仍存在）是正常数据，不报。
  */
 const GHOST_MESSAGE_TYPES = new Set(['user/message', 'assistant/message', 'system/message', 'developer/message', 'tool/call', 'tool/result']);
 
-async function scanGhostSessions(ctx, persistence) {
-  const snapshots = await persistence.list({});
+/** 从 workspace registry 收集全部登记过的会话 id（记账槽位 + 归档/置顶集合）。 */
+function registrySessionIds(registry) {
+  const ids = new Set();
+  if (!registry) return ids;
+  for (const entity of registry.list?.() ?? []) {
+    for (const id of entity?.record?.sessionIds ?? []) ids.add(id);
+  }
+  for (const id of registry.archivedSessionIds ?? []) ids.add(id);
+  for (const id of registry.pinnedSessionIds ?? []) ids.add(id);
+  return ids;
+}
+
+/** 幽灵会话扫描主入口。返回按类别分组的列表与可一键清理的 id 集。 */
+async function scanGhostSessions(ctx, persistence, registry) {
   const state = await loadTrash();
-  const ghosts = [];
+  const trashed = new Set();
+  for (const row of Object.values(state.sessions)) {
+    trashed.add(row.id);
+    for (const member of row.members ?? []) trashed.add(member.id);
+  }
+
+  // 父链：子会话的父会话是否仍存在于磁盘（subagent 归属正常性判定）。
+  const snapshots = await persistence.list({});
+  const onDisk = new Map();
   for (const snapshot of snapshots) {
-    const id = snapshot?.header?.id;
-    if (typeof id !== 'string') continue;
-    if (state.sessions[id]) continue; // 已在回收站
+    const header = snapshot?.header;
+    if (typeof header?.id === 'string') onDisk.set(header.id, header);
+  }
+  const accounted = registrySessionIds(registry);
+
+  const blank = [];
+  const orphan = [];
+  const registryGhost = [];
+
+  // —— 有日志的：判 a（空壳）与 b（孤儿）——
+  for (const [id, header] of onDisk) {
+    if (trashed.has(id)) continue;
     if (runningAgentIds(ctx, [id]).length > 0) continue;
-    // 空会话的日志极小（只有头部一行）；完整解析做最终判定。
+    if (header.origin === 'subagent' && typeof header.parentSession === 'string' && onDisk.has(header.parentSession)) continue;
     const found = await persistence.findLog(id);
     const currentPath = typeof found?.currentPath === 'string' ? found.currentPath : typeof found === 'string' ? found : undefined;
     if (!currentPath) continue;
     try {
       const records = parseLogRecords(await readLogText(currentPath));
       const hasContent = records.some((record) => GHOST_MESSAGE_TYPES.has(record?.type) || record?.type === 'turn/start');
-      if (hasContent) continue;
-      ghosts.push({
-        id,
-        cwd: snapshot.header.cwd,
-        createdAt: snapshot.header.createdAt,
-        sizeBytes: snapshot.sizeBytes,
-      });
+      if (!hasContent) {
+        blank.push({ id, cwd: header.cwd, createdAt: header.createdAt, kind: 'blank' });
+      } else if (!accounted.has(id) && header.origin !== 'subagent') {
+        // 有内容但无记账、也非 subagent：只有两种可见途径都没有 → 幽灵。
+        // 注：DSH 的「未分组」兜底仍可能显示它（浏览器有过期摘要时），
+        // 但权威列表里它没有归属，重启后必消失——按幽灵报告，由用户裁决。
+        orphan.push({ id, cwd: header.cwd, createdAt: header.createdAt, kind: 'orphan', sizeBytes: snapshotSize(persistence, id) });
+      }
     } catch {
       // 日志读不出来不判为幽灵（可能是损坏的正常会话）。
     }
   }
-  return { ghosts };
+
+  // —— 无日志的：判 c（记账/缓存幽灵）——
+  // 记账侧：registry 里登记、日志不在、也不在回收站。
+  for (const id of accounted) {
+    if (trashed.has(id) || onDisk.has(id)) continue;
+    registryGhost.push({ id, kind: 'registry' });
+  }
+  // 缓存侧：投影缓存目录里有记录、但日志与记账都没有。直接读目录（缓存
+  // 服务没有枚举接口，目录布局是稳定的 per-record JSON）。
+  try {
+    const cacheDir = join(resolveDshHome(), 'storages', 'session_projcache', 'sessions');
+    for (const entry of await readdir(cacheDir)) {
+      if (!entry.endsWith('.json')) continue;
+      const id = entry.slice(0, -'.json'.length);
+      if (trashed.has(id) || onDisk.has(id) || accounted.has(id)) continue;
+      if (registryGhost.some((ghost) => ghost.id === id)) continue;
+      registryGhost.push({ id, kind: 'cache' });
+    }
+  } catch {
+    // 缓存目录不可读时跳过缓存侧（登记侧已覆盖常见情形）。
+  }
+
+  return { blank, orphan, registryGhost };
+}
+
+/** 日志大小（孤儿行展示用）。 */
+async function snapshotSize(persistence, id) {
+  try {
+    const snapshot = await persistence.stat(id);
+    return snapshot?.sizeBytes;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1070,7 +1142,7 @@ export async function apply(ctx) {
               return;
             }
             if (req.method === 'GET' && method === 'ghosts') {
-              writeJson(res, 200, { ok: true, data: await scanGhostSessions(ctx, persistence) });
+              writeJson(res, 200, { ok: true, data: await scanGhostSessions(ctx, persistence, registry) });
               return;
             }
             const body = await readJsonBody(req);

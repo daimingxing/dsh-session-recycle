@@ -52,14 +52,19 @@ window.__ModuleLoader__.load({
       'trash.untitled': '未命名会话',
       'trash.badgeMoving': '待收尾',
       'trash.badgePurge': '待物理清除',
-      'ghost.hint': '扫描各工作区里从未说过话的空白会话（侧边栏不显示的残留）',
+      'ghost.hint': '扫描磁盘上有痕迹、但两边都不可见的会话：空壳（0 消息）、孤儿残壳（有内容却无归属）、登记幽灵（记账/缓存残留）',
       'ghost.scan': '扫描幽灵会话',
       'ghost.scanning': '扫描中…',
       'ghost.none': '没有幽灵会话',
-      'ghost.title': '空白会话（0 条消息）',
+      'ghost.kindBlank': '空白会话（0 条消息）',
+      'ghost.kindOrphan': '孤儿会话（有内容、无归属）',
+      'ghost.kindRegistry': '登记残留（无会话体）',
       'ghost.created': '创建时间',
-      'ghost.deleteAll': '全部移入回收站（{n}）',
+      'ghost.clean': '清除残留',
+      'ghost.deleteToTrash': '移入回收站',
+      'ghost.deleteAll': '全部清理（{n}）',
       'ghost.deleted': '已移入回收站（{n}）',
+      'ghost.purged': '已清除残留（{n}）',
       'ghost.scanFailed': '扫描失败：{message}',
       'preview.title': '会话预览',
       'preview.close': '关闭',
@@ -91,14 +96,19 @@ window.__ModuleLoader__.load({
       'trash.untitled': 'Untitled session',
       'trash.badgeMoving': 'finishing',
       'trash.badgePurge': 'purge pending',
-      'ghost.hint': 'Scan for blank sessions that never received a message (hidden residue in every workspace)',
+      'ghost.hint': 'Scan for sessions that exist on disk but are invisible on both sides: blank shells (0 messages), orphaned logs with content but no accounting, and registry/cache residue',
       'ghost.scan': 'Scan ghost sessions',
       'ghost.scanning': 'Scanning…',
       'ghost.none': 'No ghost sessions',
-      'ghost.title': 'Blank session (0 messages)',
+      'ghost.kindBlank': 'Blank sessions (0 messages)',
+      'ghost.kindOrphan': 'Orphaned sessions (content, no accounting)',
+      'ghost.kindRegistry': 'Registry residue (no log body)',
       'ghost.created': 'Created',
-      'ghost.deleteAll': 'Move all to trash ({n})',
+      'ghost.clean': 'Clean residue',
+      'ghost.deleteToTrash': 'Move to trash',
+      'ghost.deleteAll': 'Clean all ({n})',
       'ghost.deleted': 'Moved to trash ({n})',
+      'ghost.purged': 'Residue cleaned ({n})',
       'ghost.scanFailed': 'Scan failed: {message}',
       'preview.title': 'Session preview',
       'preview.close': 'Close',
@@ -154,6 +164,10 @@ window.__ModuleLoader__.load({
   border:1px dashed var(--dsw-alias-border-l2);border-radius:10px}
 .dst-ghost-hint{flex:1;color:var(--dsw-alias-label-secondary);font-size:12px}
 .dst-ghost-list{display:flex;flex-direction:column;gap:8px}
+.dst-ghost-group{display:flex;flex-direction:column;gap:8px}
+.dst-ghost-group-head{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.dst-row-id{font-family:var(--ds-font-family-code, monospace);font-size:11px;
+  color:var(--dsw-alias-label-primary);word-break:break-all;white-space:normal}
 .dst-ghost-divider{border-top:1px solid var(--dsw-alias-border-l1);margin:6px 0}
 /* 设置导航图标：隐藏壳的默认齿轮，用内联 data-mask 画垃圾桶（currentColor 跟随
    主题 hover/active）。标记由 MutationObserver 维护（见 apply）。 */
@@ -447,53 +461,94 @@ window.__ModuleLoader__.load({
         }
       };
 
-      /** 幽灵会话扫描：0 消息的空壳（侧边栏永不显示的残留），一键全部移入回收站。 */
+      /**
+       * 幽灵会话扫描：磁盘上有痕迹、但两边都不可见的会话。三类：
+       * blank（0 消息空壳）/ orphan（有内容但无记账、父会话不在的残壳）/
+       * registry（记账或缓存里挂着 id 但日志已不在的登记幽灵）。
+       * blank/orphan 走删除（入回收站）；registry 幽灵没有会话体，走 purge
+       * 直接清登记残留。
+       */
       const [ghosts, setGhosts] = React.useState(undefined);
       const [scanning, setScanning] = React.useState(false);
       const scanGhosts = async () => {
         setScanning(true);
         try {
           const data = await api('ghosts');
-          setGhosts(data.ghosts);
+          setGhosts(data);
         } catch (error) {
           showToast({ text: t('ghost.scanFailed', { message: String(error?.message ?? error) }), holdMs: 4000, onAction: null });
         } finally {
           setScanning(false);
         }
       };
-      const deleteGhosts = async () => {
+      const deleteGhosts = async (ids) => {
         setBusy(true);
         try {
-          await api('delete', { sessionIds: ghosts.map((ghost) => ghost.id) });
+          await api('delete', { sessionIds: ids });
           setGhosts(undefined);
           reload();
-          showToast({ text: t('ghost.deleted', { n: ghosts.length }), holdMs: 2500, onAction: null });
+          showToast({ text: t('ghost.deleted', { n: ids.length }), holdMs: 2500, onAction: null });
         } catch (error) {
           showToast({ text: t('toast.deleteFailed', { message: String(error?.message ?? error) }), holdMs: 4000, onAction: null });
         } finally {
           setBusy(false);
         }
       };
+      const purgeGhosts = async (ids) => {
+        setBusy(true);
+        try {
+          await api('purge', { sessionIds: ids });
+          setGhosts(undefined);
+          reload();
+          showToast({ text: t('ghost.purged', { n: ids.length }), holdMs: 2500, onAction: null });
+        } catch (error) {
+          showToast({ text: t('toast.purgeFailed', { message: String(error?.message ?? error) }), holdMs: 4000, onAction: null });
+        } finally {
+          setBusy(false);
+        }
+      };
+      const ghostCount = ghosts === undefined ? 0 : ghosts.blank.length + ghosts.orphan.length + ghosts.registryGhost.length;
+
+      const ghostKindLabel = (kind) => (kind === 'blank' ? t('ghost.kindBlank') : kind === 'orphan' ? t('ghost.kindOrphan') : t('ghost.kindRegistry'));
+
+      const renderGhostGroup = (list, onDelete) => list.length === 0 ? null : h('div', { className: 'dst-ghost-group' },
+        h('div', { className: 'dst-ghost-group-head' }, `${ghostKindLabel(list[0].kind)} · ${list.length}`),
+        list.map((ghost) => h('div', { className: 'dst-row', key: `${ghost.kind}-${ghost.id}` },
+          h('div', { className: 'dst-row-main' },
+            h('div', { className: 'dst-row-meta dst-row-id' }, ghost.id),
+            h('div', { className: 'dst-row-meta' },
+              ghost.createdAt ? `${t('ghost.created')}: ${formatTime(ghost.createdAt)}` : '',
+              ghost.cwd ? ` · ${ghost.cwd}` : '',
+            ),
+          ),
+          h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => onDelete([ghost.id]) },
+            ghost.kind === 'registry' ? t('ghost.clean') : t('trash.deleteToTrash')),
+        )),
+      );
 
       return h('div', { className: 'dst-section' },
-        // 扫描区：常驻一行说明 + 扫描按钮；扫到结果时列出并可一键清入回收站。
+        // 扫描区：常驻一行说明 + 扫描按钮；扫到结果时按类列出。
         h('div', { className: 'dst-ghost-bar' },
           h('span', { className: 'dst-ghost-hint' }, t('ghost.hint')),
           h('button', { type: 'button', className: 'dst-btn', disabled: scanning || busy, onClick: () => void scanGhosts() },
             scanning ? t('ghost.scanning') : t('ghost.scan')),
         ),
-        ghosts !== undefined && ghosts.length === 0 && h('p', { className: 'dst-empty' }, t('ghost.none')),
-        ghosts !== undefined && ghosts.length > 0 && h('div', { className: 'dst-ghost-list' },
-          ghosts.map((ghost) => h('div', { className: 'dst-row', key: ghost.id },
-            h('div', { className: 'dst-row-main' },
-              h('div', { className: 'dst-row-title' }, t('ghost.title')),
-              h('div', { className: 'dst-row-meta' },
-                `${t('ghost.created')}: ${formatTime(ghost.createdAt)}${ghost.cwd ? ` · ${ghost.cwd}` : ''}`,
-              ),
-            ),
-          )),
-          h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => void deleteGhosts() },
-            t('ghost.deleteAll', { n: ghosts.length })),
+        ghosts !== undefined && ghostCount === 0 && h('p', { className: 'dst-empty' }, t('ghost.none')),
+        ghosts !== undefined && ghostCount > 0 && h('div', { className: 'dst-ghost-list' },
+          renderGhostGroup(ghosts.blank, deleteGhosts),
+          renderGhostGroup(ghosts.orphan, deleteGhosts),
+          renderGhostGroup(ghosts.registryGhost, purgeGhosts),
+          h('button', {
+            type: 'button',
+            className: 'dst-btn dst-btn-danger',
+            disabled: busy,
+            onClick: () => {
+              const logIds = [...ghosts.blank, ...ghosts.orphan].map((ghost) => ghost.id);
+              if (logIds.length > 0) void deleteGhosts(logIds);
+              const regIds = ghosts.registryGhost.map((ghost) => ghost.id);
+              if (regIds.length > 0) void purgeGhosts(regIds);
+            },
+          }, t('ghost.deleteAll', { n: ghostCount })),
         ),
         h('div', { className: 'dst-ghost-divider' }),
         rows === undefined && h('p', { className: 'dst-empty' }, '…'),
