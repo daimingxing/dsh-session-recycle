@@ -949,37 +949,51 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
   }
   const failures = [];
 
-  // 1) 已加载成员：护栏释放（idle 常驻 agent 的写句柄不释放，unlink 必失败）。
-  //    释放失败立即返回——必须先于一切破坏性步骤，否则会出现「缓存清了、
-  //    日志没删成」的半清空状态（曾导致还原后标题丢失、被 LLM 重新生成）。
+  // 1) 释放运行时占用（先于一切破坏性步骤）：
+  //    a. 护栏 dispose 已加载的 idle agent（写句柄持有者之一）；
+  //    b. 从宿主 sessions 内存表卸载（UI 保留会话时同样持有写句柄——
+  //       v0.1 的教训：只 dispose agent 不够，sessions 表的 entry 也占着）。
+  //    任一步失败立即返回，日志目录一个字节都不动。
   try {
     await releaseLoadedSession(ctx, guard, id);
   } catch (error) {
     failures.push({ id, phase: 'release', message: String(error?.message ?? error) });
     return { failures };
   }
+  detachLiveSession(ctx, id);
 
   // 2) 物理删除（唯一不可逆步骤）——成功后才清理可逆的登记类痕迹。
-  //    顺序原则：把不可逆操作放在最前面，失败时其余痕迹原样保留，
-  //    还原路径的信息（projcache 标题）不受影响。
+  //    Windows 对刚关闭的句柄可能短暂滞留（杀软扫描/句柄表刷新）：有限
+  //    重试（~1.5s），仍失败如实报错。绝不静默降级——半清空状态比失败
+  //    更糟（曾导致还原后标题丢失、被 LLM 重新生成）。
   const member = row?.members.find((candidate) => candidate.id === id);
   if (member?.logDir) {
-    try {
-      await purgeSessionDirectory(id, member.logDir);
-    } catch (error) {
-      failures.push({ id, phase: 'purge', path: member.logDir, message: String(error?.message ?? error) });
+    let lastError;
+    let purged = false;
+    for (let attempt = 0; attempt < 5 && !purged; attempt += 1) {
+      try {
+        await purgeSessionDirectory(id, member.logDir);
+        purged = true;
+      } catch (error) {
+        lastError = error;
+        const retriable = ['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error?.code) || /EBUSY|EPERM/.test(String(error?.message));
+        if (!retriable) break;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    }
+    if (!purged) {
+      failures.push({ id, phase: 'purge', path: member.logDir, message: String(lastError?.message ?? lastError) });
       return { failures };
     }
   }
 
-  // 3) 记账摘除（幂等）+ 投影缓存记录 + 内存卸载。
+  // 3) 记账摘除（幂等）+ 投影缓存记录。
   try {
     await detachAccounting(registry, [id]);
   } catch (error) {
     failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
   }
   await removeProjectionCacheRecord(id);
-  detachLiveSession(ctx, id);
 
   return { failures };
 }
