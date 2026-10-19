@@ -10,3 +10,6 @@ test-out/
 # 运行期数据（插件自己的目录在 $DSH_HOME 下，不在仓库内，防患未然）
 index.json
 sessions/
+
+# 审查用文档（不入库）
+DESIGN-REVIEW.md
