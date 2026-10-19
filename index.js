@@ -627,7 +627,11 @@ async function scanGhostSessions(ctx, persistence, registry) {
   for (const [id, header] of onDisk) {
     if (trashed.has(id)) continue;
     if (runningAgentIds(ctx, [id]).length > 0) continue;
-    if (header.origin === 'subagent' && typeof header.parentSession === 'string' && onDisk.has(header.parentSession)) continue;
+    // subagent 且父会话仍在磁盘：正常数据，跳过。父会话不在 → 典型孤儿
+    // （主会话没了、子会话还在），继续走下面的判定。
+    const isSubagent = header.origin === 'subagent' || typeof header.parentSession === 'string';
+    const parentAlive = typeof header.parentSession === 'string' && onDisk.has(header.parentSession);
+    if (isSubagent && parentAlive) continue;
     const found = await persistence.findLog(id);
     const currentPath = typeof found?.currentPath === 'string' ? found.currentPath : typeof found === 'string' ? found : undefined;
     if (!currentPath) continue;
@@ -636,11 +640,19 @@ async function scanGhostSessions(ctx, persistence, registry) {
       const hasContent = records.some((record) => GHOST_MESSAGE_TYPES.has(record?.type) || record?.type === 'turn/start');
       if (!hasContent) {
         blank.push({ id, cwd: header.cwd, createdAt: header.createdAt, kind: 'blank' });
-      } else if (!accounted.has(id) && header.origin !== 'subagent') {
-        // 有内容但无记账、也非 subagent：只有两种可见途径都没有 → 幽灵。
-        // 注：DSH 的「未分组」兜底仍可能显示它（浏览器有过期摘要时），
-        // 但权威列表里它没有归属，重启后必消失——按幽灵报告，由用户裁决。
-        orphan.push({ id, cwd: header.cwd, createdAt: header.createdAt, kind: 'orphan', sizeBytes: snapshotSize(persistence, id) });
+      } else if (!accounted.has(id) || (isSubagent && !parentAlive)) {
+        // 孤儿 = 两种可见途径都断了：
+        //  - 主会话：无 workspace 记账（权威列表无归属，重启后必消失）；
+        //  - subagent：父会话已不在磁盘（无法从任何主会话到达）。
+        orphan.push({
+          id,
+          cwd: header.cwd,
+          createdAt: header.createdAt,
+          kind: 'orphan',
+          subOrphan: isSubagent && !parentAlive,
+          parentSession: typeof header.parentSession === 'string' ? header.parentSession : undefined,
+          sizeBytes: snapshotSize(persistence, id),
+        });
       }
     } catch {
       // 日志读不出来不判为幽灵（可能是损坏的正常会话）。
