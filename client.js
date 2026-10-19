@@ -513,21 +513,29 @@ window.__ModuleLoader__.load({
 
       const ghostKindLabel = (kind) => (kind === 'blank' ? t('ghost.kindBlank') : kind === 'orphan' ? t('ghost.kindOrphan') : t('ghost.kindRegistry'));
 
-      const renderGhostGroup = (list, onDelete) => list.length === 0 ? null : h('div', { className: 'dst-ghost-group' },
-        h('div', { className: 'dst-ghost-group-head' }, `${ghostKindLabel(list[0].kind)} · ${list.length}`),
-        list.map((ghost) => h('div', { className: 'dst-row', key: `${ghost.kind}-${ghost.id}` },
-          h('div', { className: 'dst-row-main' },
-            h('div', { className: 'dst-row-meta dst-row-id' }, ghost.id),
-            h('div', { className: 'dst-row-meta' },
-              ghost.createdAt ? `${t('ghost.created')}: ${formatTime(ghost.createdAt)}` : '',
-              ghost.cwd ? ` · ${ghost.cwd}` : '',
-              ghost.subOrphan && ghost.parentSession ? ` · ${t('ghost.parentGone', { parent: ghost.parentSession })}` : '',
+      const renderGhostGroup = (list, onDelete, { groupButton = false } = {}) => {
+        if (list.length === 0) return null;
+        // groupButton：整组一个动作按钮（登记残留——无内容差异，逐条清理
+        // 没有决策价值）。默认逐条按钮（blank/orphan 进回收站，可只清一条
+        // 留下其余反悔）。
+        return h('div', { className: 'dst-ghost-group' },
+          h('div', { className: 'dst-ghost-group-head' }, `${ghostKindLabel(list[0].kind)} · ${list.length}`),
+          list.map((ghost) => h('div', { className: 'dst-row', key: `${ghost.kind}-${ghost.id}` },
+            h('div', { className: 'dst-row-main' },
+              h('div', { className: 'dst-row-meta dst-row-id' }, ghost.id),
+              h('div', { className: 'dst-row-meta' },
+                ghost.createdAt ? `${t('ghost.created')}: ${formatTime(ghost.createdAt)}` : '',
+                ghost.cwd ? ` · ${ghost.cwd}` : '',
+                ghost.subOrphan && ghost.parentSession ? ` · ${t('ghost.parentGone', { parent: ghost.parentSession })}` : '',
+              ),
             ),
-          ),
-          h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => onDelete([ghost.id]) },
-            ghost.kind === 'registry' ? t('ghost.clean') : t('ghost.deleteToTrash')),
-        )),
-      );
+            !groupButton && h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => onDelete([ghost.id]) },
+              t('ghost.deleteToTrash')),
+          )),
+          groupButton && h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => onDelete(list.map((ghost) => ghost.id)) },
+            `${t('ghost.clean')}（${list.length}）`),
+        );
+      };
 
       return h('div', { className: 'dst-section' },
         // 扫描区：常驻一行说明 + 扫描按钮；扫到结果时按类列出。
@@ -540,7 +548,7 @@ window.__ModuleLoader__.load({
         ghosts !== undefined && ghostCount > 0 && h('div', { className: 'dst-ghost-list' },
           renderGhostGroup(ghosts.blank, deleteGhosts),
           renderGhostGroup(ghosts.orphan, deleteGhosts),
-          renderGhostGroup(ghosts.registryGhost, purgeGhosts),
+          renderGhostGroup(ghosts.registryGhost, purgeGhosts, { groupButton: true }),
           h('button', {
             type: 'button',
             className: 'dst-btn dst-btn-danger',
