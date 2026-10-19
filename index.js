@@ -128,11 +128,13 @@ function legacyTrashHome() {
 // }
 
 /**
- * 读回收站索引。三类读况分别处理（审查 P2-8）：
+ * 读回收站索引。四类读况分别处理：
  *  - ENOENT（从未创建）：正常空索引；
- *  - JSON 损坏 / 行结构不合规：先把原文件备份为 `.corrupt-<时间戳>`（保留
- *    用户删除元数据供手工抢救），再按空索引继续——不让面板打不开；
- *  - 其他 I/O 错误（EACCES 等）：**抛出**。以空索引继续会让后续 save 把
+ *  - JSON 语法损坏 / unit 名不符 / 行结构损坏（复审 P2-5）：先备份原文为
+ *    `.corrupt-<时间戳>` 供手工抢救，再按空索引继续；备份失败向上抛——
+ *    数据不可抢救前拒绝服务，绝不让写事务覆盖未备份的原文；
+ *  - v1 版本号：按空索引处理（启动迁移流程清旧数据）；
+ *  - 其他 I/O 错误（EACCES 等）：抛出。以空索引继续会让后续 save 把
  *    读不到的删除记录覆盖掉，宁可拒绝服务也不丢数据。
  */
 async function loadTrash() {
@@ -157,25 +159,42 @@ async function loadTrash() {
   // v1 索引（物理移动语义）不迁移：条目里的 fromDir 指向早已被搬走的
   // 路径，按 v2 语义解读会误导 purge。启动迁移流程会清掉旧数据。
   if (doc?.version === 1 || doc?.unit?.version === 1) return { version: TRASH_VERSION, sessions: {} };
-  // 行结构校验：sessions 必须是对象，行必须有合法 id（审查 P1-1 的纵深
-  // 防御之一：索引内容也不被信任）。
+  // 行结构校验：sessions 必须是对象，行必须有合法 id（P1-1 的纵深防御：
+  // 索引内容也不被信任）。结构损坏的行**不静默丢弃**（复审 P2-5）——任
+  // 何一行被丢弃都先备份整个原文为 .corrupt-<时间戳>，下一次写事务覆盖
+  // 索引前用户仍能从备份里抢救恢复元数据。
   const rawSessions = typeof doc.sessions === 'object' && doc.sessions !== null ? doc.sessions : {};
   const sessions = {};
+  let structuralCorrupt = false;
+  if (typeof doc.sessions !== 'object' || doc.sessions === null) structuralCorrupt = true;
   for (const [key, row] of Object.entries(rawSessions)) {
-    if (row === null || typeof row !== 'object') continue;
-    if (typeof row.id !== 'string' || !UUID_PATTERN.test(row.id) || row.id !== key) continue;
-    if (!Array.isArray(row.members)) continue;
+    const valid =
+      row !== null &&
+      typeof row === 'object' &&
+      typeof row.id === 'string' &&
+      UUID_PATTERN.test(row.id) &&
+      row.id === key &&
+      Array.isArray(row.members);
+    if (!valid) {
+      structuralCorrupt = true;
+      continue;
+    }
     sessions[key] = row;
+  }
+  if (structuralCorrupt) {
+    await backupCorruptIndex(raw);
   }
   return { version: TRASH_VERSION, sessions };
 }
 
-/** 把损坏的索引原文备份成 .corrupt-<时间戳>（失败不阻断——面板仍可用）。 */
+/**
+ * 把损坏的索引原文备份成 .corrupt-<时间戳>。备份失败向上抛——loadTrash
+ * 把它传给调用方，写事务在事务内失败，**不会**用恢复后的状态覆盖未备份
+ * 的损坏原文（复审 P2-5：宁可拒绝服务也不丢用户可抢救的数据）。
+ */
 async function backupCorruptIndex(raw) {
-  try {
-    const backupPath = `${trashIndexPath()}.corrupt-${Date.now()}`;
-    await writeFile(backupPath, raw, 'utf8');
-  } catch { /* 备份失败不阻断启动 */ }
+  const backupPath = `${trashIndexPath()}.corrupt-${Date.now()}`;
+  await writeFile(backupPath, raw, 'utf8');
 }
 
 /**
@@ -366,18 +385,22 @@ function installRuntimeGuard(ctx) {
     },
     { global: true },
   );
-  // effect 的回调在安装时执行一次（无副作用），返回的函数才是卸载钩子。
-  ctx.effect(() => {
-    // 身份比较在宿主代理化读取下不可靠（每次读可能返回新对象），所以
-    // 卸载不依赖比较：直接恢复 patchTarget 保留的原始引用。若恢复本身
-    // 失败（只读），至少清掉本插件的内存状态，避免幽灵 handle。
+  // Cordis effect 语义（复审 P1-1）：传入的回调**在安装时立即执行**，回
+  // 调返回的函数才是卸载钩子。回调本身必须无副作用——上一版把恢复逻辑写
+  // 在回调里，等于安装即撤销包装。这里回调只返回清理函数；清理函数做两
+  // 件事：恢复原始方法 + 清空内存状态。恢复直接写回 patchTarget 保存的原
+  // 始引用（安装时赋值成功过，可写性已验证；不依赖身份比较——宿主代理化
+  // 读取下 `agents.create === create` 不可靠）。
+  let uninstalled = false;
+  ctx.effect(() => () => {
+    if (uninstalled) return; // 幂等：Cordis 可能多次触发
+    uninstalled = true;
     try {
       agents.create = patchTarget.create;
       agents.resume = patchTarget.resume;
-    } catch { /* 只读服务：无法恢复，留待重装覆盖 */ }
+    } catch { /* 只读服务：无法恢复方法，仍清内存状态 */ }
     handles.clear();
     blocked.clear();
-    return undefined;
   }, 'session-trash: runtime guard');
 
   return { available: true, handles, blocked };
@@ -614,9 +637,10 @@ async function detachAccounting(registry, ids) {
 /**
  * 还原后重新挂账：按 cwd 找工作区实体 attach；已归档的重新归档。
  *
- * attach 失败向外抛（审查 P2-9）：调用方（restoreFromTrash）据此保留
- * 回收站行——挂账失败而摘行 = 会话凭空消失。工作区不存在（cwd 找不到
- * 实体）不是错误：会话落在「未分组」，可接受。
+ * attach / archive 失败都向外抛（复审 P2-4）：调用方（restoreFromTrash）
+ * 据此保留回收站行——挂账或归档状态恢复失败而摘行 = 元数据丢失且无法
+ * 重试。工作区不存在（cwd 找不到实体）不是错误：会话落在「未分组」，
+ * 可接受。
  */
 async function reattachAccounting(registry, row) {
   if (!registry) return;
@@ -630,9 +654,7 @@ async function reattachAccounting(registry, row) {
     if (entity) await entity.attachSession(row.id);
   }
   if (row.archived) {
-    try {
-      await registry.archiveSession(row.id);
-    } catch { /* 归档失败不影响还原（展示状态，会话本体已回来） */ }
+    await registry.archiveSession(row.id); // 失败向外抛 → restore 保留行
   }
 }
 
@@ -848,14 +870,17 @@ async function snapshotSize(persistence, id) {
  * 的空闲成员经护栏 dispose（释放写句柄，阻止重新加载）；护栏不可用或
  * 释放失败则该行如实报错——不做任何物理动作，回滚只是删索引行。
  *
- * 并发约束（审查 P1-6）：整棵树的 blocked 保留发生在**任何 await 之前**
- * （纯内存 Set 操作），删除期间的并发 resume 在 wrap 入口即被拒；事务
- * 失败时统一撤销保留。索引写入经 withTrashLock 串行（P1-5）。
+ * 并发约束：操作互斥（复审 P1-2，与 purge/restore 同一把 per-id 锁，
+ * 锁内发现树成员后把锁扩展到整棵树——通过在锁内重新以全树 id 集合再
+ * 入锁实现层级获取）；索引写入经 withTrashLock 串行（P1-5）；blocked
+ * 保留在树集合确定后立即做（此时已持锁，无并发窗口）。
  */
 async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   const roots = normalizeIds(sessionIds);
   if (roots.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
-  // 收集本请求涉及的全部 id，先同步保留 blocked（任何 await 之前）。
+  // 先在锁外展开树（只读 lineage，无并发风险——buildLineage 只读持久化
+  // 列表），然后一次获取全部 id 的锁（根 + 成员一起，全序获取防死锁）。
+  // 不做嵌套获取：同一函数里对重叠 id 集合二次加锁 = 自己等自己。
   const children = await buildLineage(persistence);
   const trees = new Map();
   for (const rootId of roots) {
@@ -863,8 +888,14 @@ async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   }
   const allIds = new Set();
   for (const tree of trees.values()) for (const id of tree) allIds.add(id);
+  return withSessionOps(allIds, () => deleteToTrashLocked(ctx, guard, persistence, registry, roots, trees, allIds));
+}
+
+/** delete 主体（已持有 roots + 全树成员的操作锁）。 */
+async function deleteToTrashLocked(ctx, guard, persistence, registry, roots, trees, allIds) {
+  // blocked 保留（已持锁，无并发窗口）。
   for (const id of allIds) guard.blocked.add(id);
-  // 运行检查也在保留之后立刻做：运行中的树整体拒绝，撤销保留。
+  // 运行检查：运行中的树整体拒绝，撤销保留。
   for (const [rootId, tree] of trees) {
     const running = runningAgentIds(ctx, tree);
     if (running.length > 0) {
@@ -873,20 +904,15 @@ async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
     }
   }
 
-  // 失败路径统一撤销 blocked 保留 + 卸载已释放的成员状态。
-  const releasedIds = [];
-  const releaseFailure = { error: undefined };
   try {
     const projectionCache = ctx.get('sessionProjectionCache');
     const now = Date.now();
     const plans = [];
-    const skipped = [];
 
     for (const rootId of roots) {
       // 幂等跳过判断放进事务前的快照读（blocked 保留不影响幂等性）。
       const state = await loadTrash();
       if (state.sessions[rootId]) {
-        skipped.push(rootId);
         continue;
       }
       const tree = trees.get(rootId);
@@ -991,8 +1017,6 @@ async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
       throw trashError('TRASH_PARTIAL', failures.map((failure) => failure.message).join('；'));
     }
     return { results, failures: [] };
-  } catch (error) {
-    throw error;
   } finally {
     // 收尾（成功与失败都要）：blocked 的保留语义收敛——按索引重建即为
     // 终态（成功：新行在 = 保持 blocked；失败：无新行 = 撤销保留）。
@@ -1001,7 +1025,40 @@ async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   }
 }
 
-/** syncBlocked 的去抖触发：同一轮微任务内多次变更只重算一次。 */
+/**
+ * 会话操作互斥（复审 P1-2）：同一会话 id 的 delete/restore/purge 必须
+ * 串行——purge 在锁外做物理删除，并发的 restore 能在删除完成前摘行返回
+ * "成功"，purge 拿旧行继续把已还原会话的日志删掉。锁覆盖从状态读取到
+ * 物理操作结束的完整周期；索引提交锁（withTrashLock）只解决覆盖问题，
+ * 不管操作互斥。
+ *
+ * 实现：每 id 一个 promise 链（Map<id, Promise>）。`withSessionOps(ids,
+ * body)` 先按 id 全序（排序）依次挂到各链尾（全序获取防死锁），全部到
+ * 位后执行 body，无论成败按相反顺序释放。空 id 集直接执行。
+ */
+const sessionOpsLocks = new Map();
+
+async function withSessionOps(ids, body) {
+  const sorted = [...ids].sort();
+  if (sorted.length === 0) return body();
+  /** 依次获取：等前一个持有者的链尾，然后把链尾换成自己的释放门。 */
+  const held = [];
+  try {
+    for (const id of sorted) {
+      const previous = sessionOpsLocks.get(id) ?? Promise.resolve();
+      let releaseGate;
+      const gate = new Promise((resolveGate) => { releaseGate = resolveGate; });
+      sessionOpsLocks.set(id, previous.then(() => gate));
+      await previous;
+      held.push({ id, releaseGate });
+    }
+    return await body();
+  } finally {
+    // 按获取的相反顺序释放；链尾指向下一等待者（无等待者时 Map 条目会被
+    // 下一次 withSessionOps 覆盖，不累积）。
+    for (const { releaseGate } of held.reverse()) releaseGate?.();
+  }
+}
 let syncBlockedQueued = false;
 function syncBlockedSoon() {
   if (syncBlockedQueued) return Promise.resolve();
@@ -1035,6 +1092,13 @@ function isAccountingMissing(error) {
 async function restoreFromTrash(ctx, guard, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
+  // 操作互斥（复审 P1-2）：与 purge/delete 同一把 per-id 锁。还原在锁内
+  // 读行、挂账、摘行——并发的 purge 必须等锁，看不到中间态。
+  return withSessionOps(ids, () => restoreFromTrashLocked(ctx, guard, registry, ids));
+}
+
+/** restore 主体（已持有 ids 的操作锁）。 */
+async function restoreFromTrashLocked(ctx, guard, registry, ids) {
   const results = [];
   const failures = [];
   await withTrashLock(async () => {
@@ -1245,6 +1309,14 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
 async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
+  // 操作互斥（复审 P1-2）：锁住全部请求 id（含将发现的树成员），覆盖
+  // 状态读取 → 预检 → 物理删除 → 索引提交的完整周期。锁内重读索引，
+  // restore 不可能在我们持锁期间摘行。
+  return withSessionOps(ids, () => purgeFromTrashLocked(ctx, guard, registry, ids));
+}
+
+/** purge 主体（已持有 ids 的操作锁）。 */
+async function purgeFromTrashLocked(ctx, guard, registry, ids) {
   const state = await loadTrash();
   const results = [];
   const rows = new Map();
@@ -1268,10 +1340,11 @@ async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
   for (const memberId of allMemberIds) guard.blocked.add(memberId);
   try {
     // 3) 运行时释放（整棵树统一做，失败发生在任何删除之前）。
+    //    复审 P2-3：sessions 内存表条目可能与 agent 独立存在（agent 已
+    //    释放但宿主表仍保留），条目同样持有日志占用——**无论 agent 是否
+    //    存在都要执行 detachLiveSession**，且必须在物理删除之前完成。
     for (const memberId of allMemberIds) {
-      const live = ctx.get('agents')?.get?.(memberId);
-      if (live === undefined) continue;
-      await releaseLoadedSession(ctx, guard, memberId);
+      await releaseLoadedSession(ctx, guard, memberId); // agent 不存在时内部直接返回
       detachLiveSession(ctx, memberId);
     }
     // 4) 硬化校验预跑：对每个有 logDir 的成员做完整路径/白名单检查
