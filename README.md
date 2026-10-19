@@ -29,24 +29,38 @@ DSH 的归档会保留磁盘日志。会话回收站提供真正的清理入口�
 
 ## 📦 安装
 
-适用于 **DSH 0.2.1-rc.1 及以上的 0.2.x 版本**。将 `<name>` 替换为你的 profile 名称：
+适用于 **DSH 0.2.1-rc.1 及以上的 0.2.x 版本**。
 
 **从 npm 安装**（包发布到 npm 后可用；DSH 会安装并注册插件）：
 
 ```bash
-dsh plugin --profile <name> add dsh-session-recycle@latest
+dsh plugin --profile desktop add dsh-session-recycle@latest
 ```
+
+桌面版可直接复制。若使用浏览器（`dsh web`）或无界面（`dsh headless`），把 `desktop` 换成 `web` 或 `headless`。
 
 **从本地 npm 包安装**（适合发布前试用或离线分发；替换为实际文件路径）：
 
 ```bash
-dsh plugin --profile <name> add "D:/Downloads/dsh-session-recycle-0.2.0.tgz"
+dsh plugin --profile desktop add "D:/Downloads/dsh-session-recycle-0.2.0.tgz"
+```
+
+**卸载：**
+
+```bash
+dsh plugin --profile desktop remove dsh-session-recycle
 ```
 
 ## 🚀 三步上手
 
 1. **整理侧边栏** — 打开会话的「⋯」菜单，点击红色删除项；误删时点提示中的撤销。
+
+<img src="./screenshots/sidebar-delete.png" alt="侧边栏菜单中的删除会话" width="380">
+
 2. **管理回收站** — 进入「设置 → 会话回收站」，查看内容、还原会话，或确认后彻底删除。
+
+<img src="./screenshots/settings-trash.png" alt="设置中的会话回收站" width="720">
+
 3. **清理隐藏残留** — 在回收站运行幽灵会话扫描，检查结果后清理不再需要的记录。
 
 ## 使用须知
@@ -64,7 +78,7 @@ dsh plugin --profile <name> add "D:/Downloads/dsh-session-recycle-0.2.0.tgz"
 本地安装：
 
 ```bash
-dsh plugin --profile <name> add link:/绝对路径/dsh-session-recycle
+dsh plugin --profile desktop add link:/绝对路径/dsh-session-recycle
 ```
 
 ```bash
@@ -92,7 +106,7 @@ A recycle bin for **DeepSeek Harness**. Delete sessions with their subagent tree
 
 Soft deletion leaves logs in place. Only permanent deletion removes them from disk; global attachments and the SQLite full-text index are outside its scope. Protection applies to the current DSH process. Uninstalling the plugin or losing its index may make retained sessions reappear.
 
-Requires **DSH >= 0.2.1-rc.1, < 0.3.0**. Use the installation command above, then open **Settings → Session Trash**. Zero npm dependencies.
+Requires **DSH >= 0.2.1-rc.1, < 0.3.0**. Use the installation command above (`desktop` for the desktop app; swap to `web` or `headless` for those profiles), then open **Settings → Session Trash**. Zero npm dependencies.
 
 </details>
 
