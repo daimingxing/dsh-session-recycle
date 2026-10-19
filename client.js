@@ -462,9 +462,13 @@ window.__ModuleLoader__.load({
       }, []);
       React.useEffect(() => {
         reload();
-        // 轻轮询：其它入口（菜单删除）产生的变化几秒内出现在列表里。
-        const timer = setInterval(reload, 5000);
-        return () => clearInterval(timer);
+        // 无周期轮询（用户明确禁止）。其它入口（菜单删除）产生的变化通过
+        // visibilitychange 刷新：用户从别的页面切回设置页时重读一次列表。
+        const onVisible = () => {
+          if (document.visibilityState === 'visible') reload();
+        };
+        document.addEventListener('visibilitychange', onVisible);
+        return () => document.removeEventListener('visibilitychange', onVisible);
       }, [reload]);
       React.useEffect(() => {
         if (confirmId === undefined) return;
