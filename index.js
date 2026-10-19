@@ -898,8 +898,21 @@ async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
   const results = [];
   const failures = [];
   for (const id of ids) {
+    // 登记幽灵（无会话体的记账/缓存残留）走轻量清理：摘记账 + 删投影
+    // 缓存记录。没有日志可删，也不需要在回收站里有行。
+    if (!state.sessions[id]) {
+      try {
+        await detachAccounting(registry, [id]);
+      } catch (error) {
+        failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
+        continue;
+      }
+      await removeProjectionCacheRecord(id);
+      detachLiveSession(ctx, id);
+      results.push({ id, ok: true, residueOnly: true });
+      continue;
+    }
     const row = state.sessions[id];
-    if (!row) continue;
     const memberIds = row.members.map((member) => member.id);
     const running = runningAgentIds(ctx, memberIds);
     if (running.length > 0) {
