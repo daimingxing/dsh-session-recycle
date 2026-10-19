@@ -525,7 +525,7 @@ window.__ModuleLoader__.load({
             ),
           ),
           h('button', { type: 'button', className: 'dst-btn dst-btn-danger', disabled: busy, onClick: () => onDelete([ghost.id]) },
-            ghost.kind === 'registry' ? t('ghost.clean') : t('trash.deleteToTrash')),
+            ghost.kind === 'registry' ? t('ghost.clean') : t('ghost.deleteToTrash')),
         )),
       );
 

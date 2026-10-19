@@ -891,7 +891,7 @@ async function restoreFromTrash(ctx, persistence, registry, sessionIds) {
  *    信息，重启后无需用户再操作。
  *  - 运行中仍然硬拒绝（用户规则：正在运行的会话不允许彻底删除）。
  */
-async function purgeFromTrash(ctx, persistence, sessionIds) {
+async function purgeFromTrash(ctx, persistence, registry, sessionIds) {
   const ids = normalizeIds(sessionIds);
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
   const state = await loadTrash();
@@ -907,6 +907,14 @@ async function purgeFromTrash(ctx, persistence, sessionIds) {
     }
     const rowFailures = [];
     const deferred = [];
+    // 彻底删除的终点是"零痕迹"：除文件与缓存外，记账（sessionIds 归档/
+    // 置顶集合）也要摘除——否则 id 永远留在 workspace.json，被幽灵扫描
+    // 反复报告。删除（入回收站）时已摘过一次；这里幂等兜底。
+    try {
+      await detachAccounting(registry, memberIds);
+    } catch (error) {
+      failures.push({ id, phase: 'accounting', message: String(error?.message ?? error) });
+    }
     for (const member of row.members) {
       // 回收站副本先清；原位日志可能被写句柄锁住（已加载空闲成员）。
       try {
@@ -1170,7 +1178,7 @@ export async function apply(ctx) {
                 return;
               }
               case 'purge': {
-                const data = await purgeFromTrash(ctx, persistence, body.sessionIds);
+                const data = await purgeFromTrash(ctx, persistence, registry, body.sessionIds);
                 writeJson(res, 200, { ok: true, data });
                 return;
               }
