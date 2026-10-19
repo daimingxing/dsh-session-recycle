@@ -25,7 +25,8 @@
  *  - 运行中（agent.status !== 'idle'）的目标树整体拒绝删除（用户规则）。
  *  - 日志定位只信 `persistence.findLog`；purge 目标目录从 id + 日志头
  *    cwd 推导（projectKey/encodeSegment），绝不接受外部传入的路径。
- *  - 物理失败不静默吞掉：结果逐条报告 ok/failures，由客户端如实提示。
+ *  - 物理失败不静默吞掉：业务错误抛出（HTTP ok:false → 客户端 toast），
+ *    每条失败带 id 与阶段，可重试。
  */
 import { rm, stat, readFile, writeFile, rename, mkdir, readdir, unlink, rmdir, realpath, lstat } from 'node:fs/promises';
 import { dirname, join, relative, isAbsolute, basename } from 'node:path';
@@ -809,7 +810,12 @@ async function deleteToTrash(ctx, guard, persistence, registry, sessionIds) {
   }
   await saveTrash(state);
   ctx.emit('session-trash/changed');
-  return { results, failures };
+  // 记账摘除失败同样要可见：作为业务错误抛出（HTTP ok:false → toast），
+  // 而不是 ok:true+failures[]（客户端不读，静默）。
+  if (failures.length > 0) {
+    throw trashError('TRASH_PARTIAL', failures.map((failure) => failure.message).join('；'));
+  }
+  return { results, failures: [] };
 }
 
 /**
@@ -825,7 +831,6 @@ async function restoreFromTrash(ctx, guard, persistence, registry, sessionIds) {
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
   const state = await loadTrash();
   const results = [];
-  const failures = [];
   for (const id of ids) {
     const row = state.sessions[id];
     if (!row) continue;
@@ -838,7 +843,7 @@ async function restoreFromTrash(ctx, guard, persistence, registry, sessionIds) {
   }
   await saveTrash(state);
   ctx.emit('session-trash/changed');
-  return { results, failures };
+  return { results, failures: [] };
 }
 
 /**
@@ -945,6 +950,8 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
   const failures = [];
 
   // 1) 已加载成员：护栏释放（idle 常驻 agent 的写句柄不释放，unlink 必失败）。
+  //    释放失败立即返回——必须先于一切破坏性步骤，否则会出现「缓存清了、
+  //    日志没删成」的半清空状态（曾导致还原后标题丢失、被 LLM 重新生成）。
   try {
     await releaseLoadedSession(ctx, guard, id);
   } catch (error) {
@@ -952,7 +959,20 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
     return { failures };
   }
 
-  // 2) 记账摘除（幂等）+ 投影缓存记录。
+  // 2) 物理删除（唯一不可逆步骤）——成功后才清理可逆的登记类痕迹。
+  //    顺序原则：把不可逆操作放在最前面，失败时其余痕迹原样保留，
+  //    还原路径的信息（projcache 标题）不受影响。
+  const member = row?.members.find((candidate) => candidate.id === id);
+  if (member?.logDir) {
+    try {
+      await purgeSessionDirectory(id, member.logDir);
+    } catch (error) {
+      failures.push({ id, phase: 'purge', path: member.logDir, message: String(error?.message ?? error) });
+      return { failures };
+    }
+  }
+
+  // 3) 记账摘除（幂等）+ 投影缓存记录 + 内存卸载。
   try {
     await detachAccounting(registry, [id]);
   } catch (error) {
@@ -960,16 +980,6 @@ async function cleanSessionTraces(ctx, guard, registry, id, row) {
   }
   await removeProjectionCacheRecord(id);
   detachLiveSession(ctx, id);
-
-  // 3) 原位日志目录——只有回收站行记录过 logDir 才知道去哪找。
-  const member = row?.members.find((candidate) => candidate.id === id);
-  if (member?.logDir) {
-    try {
-      await purgeSessionDirectory(id, member.logDir);
-    } catch (error) {
-      failures.push({ id, phase: 'purge', path: member.logDir, message: String(error?.message ?? error) });
-    }
-  }
 
   return { failures };
 }
@@ -983,7 +993,6 @@ async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
   if (ids.length === 0) throw trashError('BAD_REQUEST', 'sessionIds is required');
   const state = await loadTrash();
   const results = [];
-  const failures = [];
   for (const id of ids) {
     const row = state.sessions[id];
     const memberIds = row ? row.members.map((member) => member.id) : [id];
@@ -1003,7 +1012,13 @@ async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
     }
     if (rowFailures.length > 0) {
       failures.push(...rowFailures);
-      continue; // 保留行：可重试
+      // 失败必须让客户端看到：抛错 → HTTP 层转成 ok:false → 客户端弹
+      // purgeFailed toast。以前作为 ok:true+failures[] 返回，客户端不读
+      // failures，彻底删除失败完全静默（用户点按钮像没反应）。
+      throw trashError(
+        'PURGE_FAILED',
+        rowFailures.map((failure) => `${failure.id.slice(0, 20)}…: ${failure.message}`).join('；'),
+      );
     }
     if (!row) {
       // 登记幽灵：无行可摘，痕迹已清完。
@@ -1015,7 +1030,7 @@ async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
   }
   await saveTrash(state);
   ctx.emit('session-trash/changed');
-  return { results, failures };
+  return { results, failures: [] };
 }
 
 /** 只读预览：折叠回收站日志的当前表层为紧凑行（末尾 PREVIEW_TAIL 条）。 */
