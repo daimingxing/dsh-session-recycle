@@ -167,6 +167,23 @@ function trashError(code, message) {
 }
 
 /**
+ * 会话目录名编码：与 `dsh-session-persistence-jsonl` 的 encodeSegment 逐
+ * 字节一致（非 [A-Za-z0-9._-] 字符编码为 ~XXXX，~ 自身亦转义）。v0.1 不
+ * 需要（还原靠索引记录的路径）；v0.2 的 purge「路径只能从 id 推导」校验
+ * 以它为基准。parity 测试对真实日志逐字节验证两侧一致性。
+ */
+function encodeSegment(raw) {
+  let out = '';
+  for (let i = 0; i < raw.length; i += 1) {
+    const code = raw.charCodeAt(i);
+    const ch = String.fromCharCode(code);
+    if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) out += ch;
+    else out += `~${code.toString(16).toUpperCase().padStart(4, '0')}`;
+  }
+  return out;
+}
+
+/**
  * 会话是否正在运行。唯一可信证据：agents 注册表里该会话的 agent 不在
  * idle（`session.lock` 文件会幸存，不能作为证据）。
  */

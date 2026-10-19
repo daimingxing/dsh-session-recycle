@@ -114,20 +114,9 @@ window.__ModuleLoader__.load({
       'preview.turns': '{n} turns',
     };
 
-    /** 组件样式：只引用宿主主题 token，卸载时随 <style> 移除。 */
+    /** 组件样式：只引用宿主主题 token，卸载时随 <style> 移除。
+     *  （浮层样式在 TOAST_CSS——命令式 DOM 的生命周期独立于 STYLE 块。） */
     const STYLE = `
-.dst-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:12000;
-  display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:10px;
-  background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);
-  border:1px solid var(--dsw-alias-border-l1);box-shadow:0 8px 24px rgba(0,0,0,.18);
-  font-size:13px;animation:dst-in .18s ease-out}
-@keyframes dst-in{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
-.dst-toast-action{display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:13px;
-  padding:4px 12px;border-radius:7px;
-  color:var(--dsw-alias-bg-overlay);background:var(--dsw-alias-brand-primary);
-  border:1px solid var(--dsw-alias-brand-primary)}
-.dst-toast-action:hover{filter:brightness(1.12)}
-.dst-toast-action svg{flex:none}
 .dst-overlay{position:fixed;inset:0;z-index:900;background:rgba(0,0,0,.35);
   display:flex;align-items:center;justify-content:center}
 .dst-modal{background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);
@@ -206,22 +195,96 @@ window.__ModuleLoader__.load({
     }
 
     /* ---------------------------------------------------------------- */
-    /*  撤销浮层（shell.overlay）                                          */
+    /*  撤销/错误浮层（命令式 DOM，直挂 body）                                */
     /* ---------------------------------------------------------------- */
 
-    /** 模块级浮层状态：菜单项与设置页共用一个 toast 通道。 */
+    /**
+     * 浮层不用 React 槽位渲染：shell.overlay 挂在宿主 React 树内部，其容器
+     * 层级被设置对话框（z-index 1000-1100，实测）压住——组件自身 z-index 再
+     * 高也没用。这里直接创建 DOM 挂到 document.body（逃出宿主容器），样式
+     * 与撤销动作保持原设计。React 组件只剩一个空的注册占位（见 apply）。
+     */
     let toastState = null;
-    const toastListeners = new Set();
     let toastTimer = null;
+    let toastEl = null;
+
+    /** 浮层 CSS（独立于 STYLE 块：生命周期与 #dst-toast-root 元素绑定）。 */
+    const TOAST_CSS = `
+#dst-toast-root{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:12000;
+  display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:10px;
+  background:var(--dsw-alias-bg-overlay,#2a2a2a);color:var(--dsw-alias-label-primary,#fff);
+  border:1px solid var(--dsw-alias-border-l1,#444);box-shadow:0 8px 24px rgba(0,0,0,.18);
+  font-size:13px;max-width:min(680px,92vw);animation:dst-in .18s ease-out}
+@keyframes dst-in{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+#dst-toast-root .dst-toast-action{display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-size:13px;
+  padding:4px 12px;border-radius:7px;flex:none;
+  color:var(--dsw-alias-bg-overlay,#2a2a2a);background:var(--dsw-alias-brand-primary,#4c8bf5);
+  border:1px solid var(--dsw-alias-brand-primary,#4c8bf5)}
+#dst-toast-root .dst-toast-action:hover{filter:brightness(1.12)}
+#dst-toast-root .dst-toast-text{white-space:pre-wrap;word-break:break-word}
+`;
+
+    function ensureToastRoot() {
+      if (toastEl !== null && toastEl.isConnected) return toastEl;
+      const style = document.createElement('style');
+      style.dataset.plugin = 'dsh-session-toast';
+      style.textContent = TOAST_CSS;
+      document.head.appendChild(style);
+      toastEl = document.createElement('div');
+      toastEl.id = 'dst-toast-root';
+      toastEl.setAttribute('role', 'status');
+      document.body.appendChild(toastEl);
+      return toastEl;
+    }
+
+    function renderToast() {
+      if (toastState === null) {
+        toastEl?.remove();
+        toastEl = null;
+        return;
+      }
+      const root = ensureToastRoot();
+      root.textContent = '';
+      const text = document.createElement('span');
+      text.className = 'dst-toast-text';
+      text.textContent = toastState.text;
+      root.appendChild(text);
+      if (toastState.onAction !== null && toastState.onAction !== undefined) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'dst-toast-action';
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('width', '14');
+        svg.setAttribute('height', '14');
+        svg.setAttribute('aria-hidden', 'true');
+        for (const d of ['M3 12a9 9 0 1 0 2.6-6.4L3 8', 'M3 3v5h5']) {
+          const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+          path.setAttribute('d', d);
+          path.setAttribute('fill', 'none');
+          path.setAttribute('stroke', 'currentColor');
+          path.setAttribute('stroke-width', '2.2');
+          path.setAttribute('stroke-linecap', 'round');
+          path.setAttribute('stroke-linejoin', 'round');
+          svg.appendChild(path);
+        }
+        button.appendChild(svg);
+        button.appendChild(document.createTextNode(toastState.actionLabel ?? 'OK'));
+        button.addEventListener('click', () => {
+          void toastState.onAction();
+        });
+        root.appendChild(button);
+      }
+    }
 
     function showToast(toast) {
       toastState = { ...toast, seq: (toastState?.seq ?? 0) + 1 };
-      for (const listener of toastListeners) listener();
+      renderToast();
       if (toastTimer !== null) clearTimeout(toastTimer);
       if (toast.holdMs > 0) {
         toastTimer = setTimeout(() => {
           toastState = null;
-          for (const listener of toastListeners) listener();
+          renderToast();
         }, toast.holdMs);
       }
     }
@@ -230,7 +293,7 @@ window.__ModuleLoader__.load({
       if (toastTimer !== null) clearTimeout(toastTimer);
       toastTimer = null;
       toastState = null;
-      for (const listener of toastListeners) listener();
+      renderToast();
     }
 
     /** 删除后的 3 秒撤销浮层：撤销调 restore，成功后提示已还原。 */
@@ -251,30 +314,13 @@ window.__ModuleLoader__.load({
       });
     }
 
-    function ToastHost({ t }) {
-      const [, force] = React.useReducer((n) => n + 1, 0);
-      React.useEffect(() => {
-        toastListeners.add(force);
-        return () => toastListeners.delete(force);
-      }, []);
-      if (toastState === null) return null;
-      const { text, actionLabel, onAction } = toastState;
-      return h('div', { className: 'dst-toast', role: 'status' },
-        h('span', null, text),
-        onAction !== null && h('button', {
-          type: 'button',
-          className: 'dst-toast-action',
-          onClick: () => {
-            void onAction();
-          },
-        },
-        h('svg', { viewBox: '0 0 24 24', width: 14, height: 14, 'aria-hidden': true }, h('path', {
-          d: 'M3 12a9 9 0 1 0 2.6-6.4L3 8',
-          fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
-        }), h('path', { d: 'M3 3v5h5', fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })),
-        actionLabel,
-        ),
-      );
+    /**
+     * shell.overlay 占位：浮层已改为命令式 DOM（直挂 body），这个空组件
+     * 只是保持槽位注册（部分宿主版本要求 overlay 槽位非空，卸载时随 fiber
+     * 摘除）。所有可见行为见 ensureToastRoot/renderToast。
+     */
+    function ToastHost() {
+      return null;
     }
 
     /* ---------------------------------------------------------------- */
