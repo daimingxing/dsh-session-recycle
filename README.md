@@ -26,7 +26,7 @@
 | 🪃 孤儿会话 | 有内容但无归属：无记账，或父会话已删的 subagent |
 | 🏷️ 登记残留 | `workspace.json` / 投影缓存挂着 id，日志已不在 |
 
-**🛡️ 保护** —— 运行中的会话拒绝删除（点名）；回收站里的会话被运行时护栏阻止重新加载，从侧边栏与搜索任何档位都不可见。
+**🛡️ 保护** —— 运行中的会话拒绝删除（点名）；回收站里的会话被运行时护栏阻止重新加载，从侧边栏与搜索任何档位都不可见。彻底删除失败有明确报错提示（浮层置于设置对话框之上），失败不产生半清空状态——标题缓存等可逆痕迹保留，还原后不丢标题。
 
 ## 📦 安装
 
@@ -43,7 +43,7 @@ dsh plugin --profile <name> add link:/绝对路径/dsh-session-recycle
 - **回收站期间日志仍在 `sessions/` 原位**：不认识本插件索引的其他客户端（另一个不装插件的 DSH profile、冷会话列表）仍会列出这些会话；彻底删除后才真正消失。
 - **卸载插件或索引损坏时行会复活**：软删除的「已删除」状态由索引维持，索引没了就等于没删过。索引损坏时插件会把它备份成 `.corrupt-*` 再按空索引继续。
 - **跨进程写入拦不住**：运行时护栏只覆盖本进程；另一个 DSH 实例打开同一会话继续写日志时，本插件无法感知（不引入跨进程文件锁）。
-- **purge 宁可拒绝也不删错**：日志目录里出现白名单之外的文件（DSH 新版本引入的新文件形态）时彻底删除会报错拒绝，直到插件更新白名单。这是刻意设计。
+- **purge 宁可拒绝也不删错**：日志目录里出现白名单之外的文件（DSH 新版本引入的新文件形态）时彻底删除会报错拒绝，直到插件更新白名单。这是刻意设计。会话 id 形态支持主会话 `session-<uuid>` 与 subagent 子会话裸 `<uuid>` 两种；目录已不在的成员按已清除处理，重复彻底删除可收敛。
 - 还原后会话回到工作区列表顶部，不是原位置。
 - 附件（全局内容寻址存储）与 sqlite 全文索引（默认未启用）不在清理范围。
 - 设置导航图标按文案匹配自己的行；与其他插件文案完全相同时可能错标（仅影响图标）。
@@ -131,7 +131,7 @@ One bundle, two halves: host mounted via `cordis.patch.yml`, browser via `dsh.cl
 
 1. **Delete (no disk writes)**: append to the trash index (`$DSH_HOME/dsh-session-recycle/index.json`, atomic) → detach workspace accounting → broadcast the stock `api-session/removed`. Logs and projection-cache records stay put.
 2. **Restore (no disk writes)**: drop the index row → re-attach accounting → push `api-session/added` (title folded via `coldSnapshot`).
-3. **Permanent delete (the only physical path)**: the runtime guard `dispose()`s loaded idle agents to release write handles, then hardens before unlinking: `session-<uuid>` shape check, directory name must equal `encodeSegment(id)` (paths are derived, never accepted), realpath must resolve inside the sessions root, per-level symlink checks, a **content whitelist** (only known JSONL-backend file shapes; anything unknown refuses the whole purge), per-file `unlink` + non-recursive `rmdir`.
+3. **Permanent delete (the only physical path)**: the runtime guard `dispose()`s loaded idle agents and detaches the host sessions-store entry to release write handles, then hardens before unlinking: id shape check (`session-<uuid>` for main sessions, bare `<uuid>` for subagent children), directory name must equal `encodeSegment(id)` (paths are derived, never accepted), realpath must resolve inside the sessions root (a missing directory counts as already purged), per-level symlink checks, a **content whitelist** (only known JSONL-backend file shapes; anything unknown refuses the whole purge), per-file `unlink` + non-recursive `rmdir`. Failures surface as visible toasts and never leave a half-cleaned state — reversible traces (including the cached title) survive a failed purge, so restores keep their titles.
 
 **Runtime guard**: wraps `agents.create/resume` to capture the `{ agent, dispose }` handle at the factory boundary (the UI path drops it; the wrap is the only way to obtain it). Used to release loaded idle sessions before delete/restore and to block reloads of trashed ids. If a DSH upgrade breaks the wrap, it degrades automatically — delete falls back to refusing loaded sessions, everything else keeps working.
 
