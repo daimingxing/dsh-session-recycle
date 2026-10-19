@@ -116,7 +116,7 @@ window.__ModuleLoader__.load({
 
     /** 组件样式：只引用宿主主题 token，卸载时随 <style> 移除。 */
     const STYLE = `
-.dst-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:1000;
+.dst-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:12000;
   display:flex;align-items:center;gap:12px;padding:10px 16px;border-radius:10px;
   background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);
   border:1px solid var(--dsw-alias-border-l1);box-shadow:0 8px 24px rgba(0,0,0,.18);

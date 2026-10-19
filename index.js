@@ -1025,7 +1025,6 @@ async function purgeFromTrash(ctx, guard, persistence, registry, sessionIds) {
       }
     }
     if (rowFailures.length > 0) {
-      failures.push(...rowFailures);
       // 失败必须让客户端看到：抛错 → HTTP 层转成 ok:false → 客户端弹
       // purgeFailed toast。以前作为 ok:true+failures[] 返回，客户端不读
       // failures，彻底删除失败完全静默（用户点按钮像没反应）。
